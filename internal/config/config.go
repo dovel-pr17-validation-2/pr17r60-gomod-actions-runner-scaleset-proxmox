@@ -1,0 +1,2086 @@
+// Package config defines the orchestrator's runtime configuration: YAML
+// schema, automatic env-var overrides, defaults, and validation.
+//
+// Secrets are NEVER stored in the YAML file. Every config key — secret or
+// not — is overridable via an env var. The env-var name is the YAML key
+// path with dots replaced by underscores and uppercased, prefixed with
+// "SCALESET_". For example:
+//
+//	github.pat.token              → SCALESET_GITHUB_PAT_TOKEN
+//	proxmox.auth.token_secret     → SCALESET_PROXMOX_AUTH_TOKEN_SECRET
+//	admin_api.shared_secret       → SCALESET_ADMIN_API_SHARED_SECRET
+//	pool.hot_size                 → SCALESET_POOL_HOT_SIZE
+//
+// snake_case yaml keys are preserved as single tokens (e.g. hot_size is
+// one key, not nested under hot.size); the env-name → key-path mapping
+// is built by reflecting on the Config struct's yaml tags at init.
+package config
+
+import (
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"net/netip"
+	"net/url"
+	"os"
+	"reflect"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-playground/validator/v10"
+	"github.com/go-viper/mapstructure/v2"
+	koanfyaml "github.com/knadh/koanf/parsers/yaml"
+	koanfenv "github.com/knadh/koanf/providers/env/v2"
+	koanffile "github.com/knadh/koanf/providers/file"
+	koanfrawbytes "github.com/knadh/koanf/providers/rawbytes"
+	"github.com/knadh/koanf/v2"
+	"github.com/robfig/cron/v3"
+
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/fileperm"
+)
+
+// Duration is a [time.Duration] that decodes from a Go duration string
+// (e.g. "15s", "5m", "1h") via koanf's mapstructure pipeline. The zero
+// value represents "field not set" — distinct from an explicit "0s",
+// which Set() reports as true with D() == 0. ApplyDefaults populates
+// any field still unset; Resolve then rejects explicit non-positive
+// values on knobs that must be positive.
+type Duration struct {
+	d   time.Duration
+	set bool
+}
+
+// UnmarshalText parses a Go duration string. The empty string leaves
+// the value unset so ApplyDefaults can substitute the default.
+func (d *Duration) UnmarshalText(text []byte) error {
+	s := strings.TrimSpace(string(text))
+	if s == "" {
+		return nil
+	}
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	d.d = v
+	d.set = true
+	return nil
+}
+
+// D returns the duration value as a [time.Duration]. Unset values
+// return 0.
+func (d Duration) D() time.Duration { return d.d }
+
+// Set reports whether the field was supplied — by YAML, env override,
+// or ApplyDefaults.
+func (d Duration) Set() bool { return d.set }
+
+// OrDefault returns d's value when set, otherwise def.
+func (d Duration) OrDefault(def time.Duration) time.Duration {
+	if !d.set {
+		return def
+	}
+	return d.d
+}
+
+// setDefault populates d with def when still unset. ApplyDefaults
+// uses this so post-defaults reads via D() are always meaningful.
+func (d *Duration) setDefault(def time.Duration) {
+	if !d.set {
+		d.d = def
+		d.set = true
+	}
+}
+
+// envPrefix is the prefix every config-overriding env var must carry.
+// Chosen to namespace this orchestrator's vars against unrelated env on
+// the host. Combined with the schema map below, SCALESET_FOO_BAR_BAZ
+// uniquely identifies one koanf key path.
+const envPrefix = "SCALESET_"
+
+// Config is the full orchestrator configuration parsed from YAML.
+//
+// Profiles is an optional list of runner-profile overrides (per-label
+// hardware shapes). When empty, ApplyDefaults synthesises a single
+// "default" profile from the global Pool + Proxmox blocks so the
+// orchestrator's profile-aware internals don't have to special-case the
+// single-profile config shape.
+//
+// Quotas and Priority are optional multi-tenancy controls. Both
+// default to "disabled" — the orchestrator records per-job
+// metadata but does not throttle or re-order based on it. See the
+// quotas / priority subpackages for the routing semantics.
+type Config struct {
+	GitHub GitHubConfig `yaml:"github" validate:"required"`
+
+	// ScaleSet is the legacy singular form. Operators with a
+	// single scaleset can keep this; ApplyDefaults normalises it
+	// into a 1-element Scalesets at load time and emits a
+	// deprecation warning. New configs should declare Scalesets
+	// directly. Mutually exclusive with Scalesets.
+	ScaleSet ScaleSetConfig `yaml:"scaleset,omitempty"`
+
+	// Scalesets hosts N scale sets in one orchestrator process
+	// (issue #1). Each entry has its own listener / pool /
+	// reconciler / scaler / profiles; shared infrastructure
+	// (proxmox, nodes, pool defaults, admin API, observability,
+	// cluster coordination) lives at the top level.
+	Scalesets []ScaleSetEntry `yaml:"scalesets,omitempty"`
+
+	Proxmox ProxmoxConfig `yaml:"proxmox" validate:"required"`
+	Nodes   NodesConfig   `yaml:"nodes" validate:"required"`
+	Pool    PoolConfig    `yaml:"pool" validate:"required"`
+
+	// Profiles is the legacy top-level profiles list. When
+	// ScaleSet (singular) is used, ApplyDefaults moves these
+	// into the synthesised 1-element Scalesets entry. With
+	// Scalesets declared, this must be empty (profiles are per-
+	// scaleset to avoid label collisions across scalesets).
+	Profiles []ProfileConfig `yaml:"profiles,omitempty"`
+
+	Quotas        QuotasConfig        `yaml:"quotas"`
+	Priority      PriorityConfig      `yaml:"priority"`
+	Observability ObservabilityConfig `yaml:"observability"`
+	AdminAPI      AdminAPIConfig      `yaml:"admin_api"`
+	Cluster       ClusterConfig       `yaml:"cluster"`
+
+	// unknownEnvOverrides captures SCALESET_*-prefixed env vars present
+	// at Load time that didn't match any schema key. Exposed via
+	// [Config.UnknownEnvOverrides] so the caller can warn — typos like
+	// SCALESET_POOL_HOTSIZE (missing the second underscore) would
+	// otherwise silently no-op and leave the operator guessing why the
+	// override didn't take effect.
+	unknownEnvOverrides []string `yaml:"-"`
+}
+
+// UnknownEnvOverrides returns the SCALESET_*-prefixed env vars that
+// were present at Load time but didn't match any schema key. Callers
+// (typically the orchestrator's main()) should log each one as a
+// warning so a typo'd override is loud instead of silently dropped.
+func (c *Config) UnknownEnvOverrides() []string {
+	return append([]string(nil), c.unknownEnvOverrides...)
+}
+
+// QuotasConfig caps per-org / per-repo concurrent VMs. The actual
+// resolution lives in internal/quotas; this block is just the YAML
+// surface.
+type QuotasConfig struct {
+	// DefaultPerRepo applies to jobs whose repo has no override.
+	// 0 disables the default. The cap is per-repo: a fleet with
+	// four busy repos can have 4 × DefaultPerRepo VMs in flight
+	// (still capped by the global MaxConcurrentRunners).
+	DefaultPerRepo int `yaml:"default_per_repo" validate:"gte=0"`
+
+	// DefaultPerOrg is the same idea, applied when the job has
+	// only an org (the listener payload carries both for repo-
+	// scoped jobs).
+	DefaultPerOrg int `yaml:"default_per_org" validate:"gte=0"`
+
+	// Overrides are exact matches. Exactly one of Match.Org or
+	// Match.Repo must be set per entry; this is validated by
+	// internal/quotas at startup.
+	Overrides []QuotaOverride `yaml:"overrides"`
+}
+
+// QuotaOverride scopes a cap to one org or one owner/repo.
+type QuotaOverride struct {
+	Match         QuotaMatch `yaml:"match"`
+	MaxConcurrent int        `yaml:"max_concurrent" validate:"gte=0"`
+}
+
+// QuotaMatch is the override selector. Exactly one of Org or Repo
+// must be set.
+type QuotaMatch struct {
+	Org  string `yaml:"org,omitempty"`
+	Repo string `yaml:"repo,omitempty"`
+}
+
+// PriorityConfig declares the priority classes the scaler uses to
+// classify incoming jobs. See internal/priority for the matching
+// semantics. The block is optional — when absent every job falls
+// into the synthetic "default" class with weight 0 and
+// preempt=false.
+type PriorityConfig struct {
+	Classes []PriorityClassConfig `yaml:"classes"`
+}
+
+// PriorityClassConfig is one operator-declared class.
+type PriorityClassConfig struct {
+	Name    string              `yaml:"name" validate:"required"`
+	Match   PriorityMatchConfig `yaml:"match"`
+	Weight  int                 `yaml:"weight"`
+	Preempt bool                `yaml:"preempt"`
+}
+
+// PriorityMatchConfig is the class's selector. All non-empty
+// fields must equal their corresponding job field for the class
+// to match. An empty selector means "match everything" — useful
+// for declaring a default class.
+type PriorityMatchConfig struct {
+	WorkflowLabel string `yaml:"workflow_label,omitempty"`
+	Repo          string `yaml:"repo,omitempty"`
+	Org           string `yaml:"org,omitempty"`
+}
+
+// GitHubConfig configures GitHub authentication, scope, and the
+// REST-API-driven reconciler that closes the gap when the scaleset
+// listener drops or delivers garbled lifecycle messages.
+type GitHubConfig struct {
+	// AuthMode selects between GitHub App ("app") and personal access token
+	// ("pat") authentication.
+	AuthMode string           `yaml:"auth_mode" validate:"required,oneof=app pat"`
+	App      *GitHubAppConfig `yaml:"app,omitempty" validate:"required_if=AuthMode app"`
+	PAT      *GitHubPATConfig `yaml:"pat,omitempty" validate:"required_if=AuthMode pat"`
+
+	// Scope is the legacy top-level scope. Operators that use
+	// the singular `scaleset:` form set it here; ApplyDefaults
+	// folds it into the single Scalesets entry. Mutually
+	// exclusive with declaring Scalesets[i].Scope per-entry.
+	Scope GitHubScope `yaml:"scope,omitempty"`
+
+	// PollInterval is how often the reconciler queries the runners API.
+	// 15s is a good default — well under the rate limit and fast enough
+	// to catch missed JobCompleted within one job's worth of wall clock.
+	PollInterval Duration `yaml:"poll_interval"`
+
+	// AssignedGrace is how long a VM may sit in `assigned` (JIT
+	// injected, waiting for the runner to pick up work) before the
+	// reconciler declares it dead and destroys it.
+	AssignedGrace Duration `yaml:"assigned_grace"`
+
+	// RunningIdleGrace is how long a VM may sit in `running` with its
+	// runner observed online + idle on GitHub before the reconciler
+	// destroys it (catches missed JobCompleted callbacks).
+	RunningIdleGrace Duration `yaml:"running_idle_grace"`
+
+	// AssignedOfflineGrace is the same as AssignedGrace but for the
+	// runner-went-offline subcase; shorter because offline is a
+	// stronger failure signal.
+	AssignedOfflineGrace Duration `yaml:"assigned_offline_grace"`
+}
+
+// GitHubAppConfig configures GitHub App authentication. Exactly one of
+// ClientID (newer Apps; format "Iv23...") or AppID (legacy numeric ID)
+// must be set; this is validated in Config.Resolve.
+type GitHubAppConfig struct {
+	ClientID       string `yaml:"client_id,omitempty"`
+	AppID          int64  `yaml:"app_id,omitempty"`
+	InstallationID int64  `yaml:"installation_id" validate:"required,gt=0"`
+	PrivateKeyPath string `yaml:"private_key_path" validate:"required,file"`
+
+	// ConfigURL mirrors GitHubPATConfig.ConfigURL — a full URL with
+	// the org/repo baked in. Use for single-scaleset GHES + App
+	// auth. Mutually exclusive with ConfigBaseURL; the config
+	// validator rejects setting both, and refuses ConfigURL when
+	// more than one scaleset is declared (issue #214 + the App-side
+	// follow-up).
+	ConfigURL string `yaml:"config_url,omitempty"`
+
+	// ConfigBaseURL mirrors GitHubPATConfig.ConfigBaseURL — a
+	// scheme+host the orchestrator joins with each scaleset's
+	// scope at runtime. Required for multi-scaleset GHES + App
+	// auth.
+	ConfigBaseURL string `yaml:"config_base_url,omitempty"`
+
+	// RESTBaseURL overrides the go-github BaseURL the App-auth REST
+	// client points at. Required for GHES so the App installation
+	// token fetch + subsequent runner-list calls hit the right
+	// host. Must end with a trailing slash (go-github requirement).
+	RESTBaseURL string `yaml:"rest_base_url,omitempty"`
+}
+
+// Issuer returns the JWT issuer string for the App — preferring ClientID
+// when set, otherwise stringifying AppID.
+func (g GitHubAppConfig) Issuer() string {
+	if g.ClientID != "" {
+		return g.ClientID
+	}
+	if g.AppID > 0 {
+		return strconv.FormatInt(g.AppID, 10)
+	}
+	return ""
+}
+
+// GitHubPATConfig configures personal access token authentication. The
+// token must be supplied via the SCALESET_GITHUB_PAT_TOKEN env var (or
+// any other koanf-source override of the github.pat.token key); writing
+// it into yaml is not recommended.
+type GitHubPATConfig struct {
+	Token string `yaml:"token" koanf:"token"`
+
+	// ConfigURL overrides the default GitHub config URL the
+	// scaleset library uses. Set the full URL (e.g.
+	// "https://ghes.example.com/myorg") for a GHES single-scaleset
+	// deployment. Mutually exclusive with ConfigBaseURL.
+	//
+	// Multi-scaleset GHES deployments MUST use ConfigBaseURL, not
+	// ConfigURL — otherwise every scaleset's listener would
+	// register against the same hard-coded scope (issue #214).
+	ConfigURL string `yaml:"config_url,omitempty"`
+
+	// ConfigBaseURL is the GHES base host (scheme + host only,
+	// e.g. "https://ghes.example.com"). The orchestrator joins it
+	// with each scaleset's scope at runtime to produce the per-
+	// scope GitHubConfigURL. Required for multi-scaleset GHES;
+	// for github.com leave both ConfigURL and ConfigBaseURL empty
+	// — the default per-scope URL derivation already targets the
+	// right per-org/repo endpoint.
+	ConfigBaseURL string `yaml:"config_base_url,omitempty"`
+}
+
+// GitHubScope selects the registration target. Exactly one of Org or Repo
+// must be set; this is checked in [Config.Resolve].
+type GitHubScope struct {
+	Org  string `yaml:"org,omitempty"`
+	Repo string `yaml:"repo,omitempty"`
+}
+
+// ScaleSetConfig configures the scale set's identity. Used both
+// as the legacy singular Config.ScaleSet field and as the
+// embedded identity block in each ScaleSetEntry. The validator
+// requirements are dropped here (the wrapping struct enforces
+// them) so the singular form can be zero when Scalesets is the
+// active shape.
+type ScaleSetConfig struct {
+	Name                 string   `yaml:"name"`
+	Labels               []string `yaml:"labels"`
+	RunnerGroup          string   `yaml:"runner_group"`
+	MaxConcurrentRunners int      `yaml:"max_concurrent_runners" validate:"gte=0"`
+}
+
+// ScaleSetEntry is one scale set within a multi-scaleset config
+// (issue #1). Each entry carries its own GitHub Scope and
+// Profiles so different scale sets can serve different orgs /
+// repos with different hardware shapes. Pool defaults, Proxmox
+// connection, node placement, admin API, observability, and
+// cluster coordination stay shared at the top level.
+type ScaleSetEntry struct {
+	// Identity fields (mirror ScaleSetConfig). Required on each
+	// entry.
+	Name                 string   `yaml:"name" validate:"required"`
+	Labels               []string `yaml:"labels"`
+	RunnerGroup          string   `yaml:"runner_group"`
+	MaxConcurrentRunners int      `yaml:"max_concurrent_runners" validate:"required,gt=0"`
+
+	// Scope is the GitHub registration target for this scale
+	// set. Exactly one of Scope.Org or Scope.Repo must be set;
+	// uniqueness across the Scalesets list is enforced in
+	// Validate so two entries can't fight over the same scope.
+	Scope GitHubScope `yaml:"scope" validate:"required"`
+
+	// Profiles is the per-scaleset runner-profile catalog. May
+	// be empty: a one-profile scaleset implicitly synthesises a
+	// "default" profile from the entry's Labels +
+	// MaxConcurrentRunners + the shared Pool defaults, matching
+	// the singular-form behaviour.
+	Profiles []ProfileConfig `yaml:"profiles,omitempty"`
+
+	// VMIDRange is the per-scaleset slice of the Proxmox VMID
+	// space this scaleset's pool.Manager allocates from. With
+	// multiple scalesets sharing one Proxmox endpoint, each
+	// pool.Manager runs its own allocator unaware of siblings
+	// — so a single shared cfg.Proxmox.VMIDRange would have
+	// every scaleset's allocator pick the same lowest-free ID
+	// and race on Proxmox clone (issue #222). Operators with
+	// N > 1 scalesets MUST declare a disjoint per-scaleset
+	// range; validation rejects overlap and rejects two
+	// scalesets sharing the fall-through global range.
+	//
+	// Nil (unset) inherits cfg.Proxmox.VMIDRange — the
+	// single-scaleset back-compat path. Pointer keeps the
+	// struct-tag validator from firing on its required
+	// Min/Max sub-fields for the inherit case.
+	VMIDRange *VMIDRange `yaml:"vmid_range,omitempty"`
+}
+
+// asScaleSetConfig returns the identity fields of e in the
+// legacy ScaleSetConfig shape. Helper for code paths that
+// already speak ScaleSetConfig.
+func (e ScaleSetEntry) asScaleSetConfig() ScaleSetConfig {
+	return ScaleSetConfig{
+		Name:                 e.Name,
+		Labels:               e.Labels,
+		RunnerGroup:          e.RunnerGroup,
+		MaxConcurrentRunners: e.MaxConcurrentRunners,
+	}
+}
+
+// ProxmoxConfig configures the Proxmox VE connection and VM template/network.
+type ProxmoxConfig struct {
+	Endpoint           string         `yaml:"endpoint" validate:"required,url"`
+	InsecureSkipVerify bool           `yaml:"insecure_skip_verify"`
+	Auth               ProxmoxAuth    `yaml:"auth" validate:"required"`
+	TemplateVMID       int            `yaml:"template_vmid" validate:"required,gt=0"`
+	VMIDRange          VMIDRange      `yaml:"vmid_range" validate:"required"`
+	Storage            ProxmoxStorage `yaml:"storage" validate:"required"`
+	Network            ProxmoxNetwork `yaml:"network" validate:"required"`
+	Clone              CloneConfig    `yaml:"clone"`
+}
+
+// ProxmoxAuth holds API token credentials. The secret must be supplied
+// via the SCALESET_PROXMOX_AUTH_TOKEN_SECRET env var (or any other
+// koanf-source override of the proxmox.auth.token_secret key); writing
+// it into yaml is not recommended.
+type ProxmoxAuth struct {
+	TokenID     string `yaml:"token_id" validate:"required"`
+	TokenSecret string `yaml:"token_secret" koanf:"token_secret"`
+}
+
+// VMIDRange is the inclusive range of VMIDs the orchestrator may allocate.
+type VMIDRange struct {
+	Min int `yaml:"min" validate:"required,gt=0"`
+	Max int `yaml:"max" validate:"required,gtfield=Min"`
+}
+
+// ProxmoxStorage names the Proxmox storage pools to use.
+type ProxmoxStorage struct {
+	Disk     string `yaml:"disk" validate:"required"`
+	Snippets string `yaml:"snippets" validate:"required"`
+}
+
+// ProxmoxNetwork configures the VM NIC. VLANTag=0 means untagged.
+type ProxmoxNetwork struct {
+	Bridge  string `yaml:"bridge" validate:"required"`
+	VLANTag int    `yaml:"vlan_tag" validate:"gte=0,lte=4094"`
+}
+
+// CloneConfig configures clone behaviour.
+type CloneConfig struct {
+	// Linked controls linked-clone vs full-clone behaviour. Linked is
+	// much faster but pins clones to the template's storage. *bool so
+	// "unset" (apply default) is distinguishable from "explicitly false".
+	Linked *bool `yaml:"linked,omitempty"`
+}
+
+// LinkedOrDefault returns true unless the user explicitly set
+// `linked: false`.
+func (c CloneConfig) LinkedOrDefault() bool {
+	if c.Linked == nil {
+		return true
+	}
+	return *c.Linked
+}
+
+// NodesConfig selects the cluster placement strategy.
+//
+// Affinity, when non-empty, layers a profile-keyed filter over the
+// chosen Strategy: each rule pins or excludes nodes for a runner
+// profile before the underlying selector (single / round_robin /
+// least_loaded) gets a say. See internal/nodeselector for the
+// matching semantics; the rules here are the YAML surface.
+type NodesConfig struct {
+	Strategy   string         `yaml:"strategy" validate:"required,oneof=single round_robin least_loaded"`
+	Members    []string       `yaml:"members"`
+	SingleNode string         `yaml:"single_node"`
+	Affinity   []AffinityRule `yaml:"affinity"`
+}
+
+// AffinityRule pins or excludes nodes for a given runner profile.
+// Rules are applied in declaration order; the first rule whose
+// Match.Profile equals the cloning row's profile wins.
+type AffinityRule struct {
+	// Match selects which clones this rule applies to. An empty
+	// Profile is a wildcard (catch-all default rule). Today only
+	// the Profile dimension is supported.
+	Match AffinityMatch `yaml:"match"`
+
+	// PreferNodes restricts candidate nodes to this list. Combined
+	// with Require=true the rule is a hard pin; with Require=false
+	// it's a soft preference (fall back to the full eligible set
+	// if no preferred node is available).
+	PreferNodes []string `yaml:"prefer_nodes"`
+
+	// Require turns PreferNodes into a hard pin. The clone fails
+	// with ErrAffinityRequireUnsatisfiable when no preferred node
+	// has capacity — operators use this for "GPU profile MUST
+	// land on a GPU-equipped node".
+	Require bool `yaml:"require"`
+
+	// AntiAffinityWith excludes nodes that already host a tracked
+	// VM whose attributes match this selector. The canonical use
+	// case from issue #8 is "untrusted-PR runners must never
+	// co-schedule with prod runners on the same node".
+	AntiAffinityWith AffinityMatch `yaml:"anti_affinity_with"`
+}
+
+// AffinityMatch is the selector both Match (which jobs the rule
+// applies to) and AntiAffinityWith (which existing VMs block a
+// node) consult. Kept as a struct so future dimensions (repo / org
+// once those land on the nodeselector hint) can be added without
+// breaking the YAML shape.
+type AffinityMatch struct {
+	Profile string `yaml:"profile,omitempty"`
+}
+
+// PoolConfig configures pool sizes and timing.
+//
+// Pool-level HotSize / WarmSize / BootMaxAttempts / VMMaxAge are
+// fall-back defaults for profiles that omit those fields. GlobalMax,
+// when set, caps the sum of per-profile MaxConcurrentRunners so an
+// operator can put a fleet-wide ceiling above the per-profile arithmetic.
+type PoolConfig struct {
+	HotSize           int      `yaml:"hot_size" validate:"gte=0"`
+	WarmSize          int      `yaml:"warm_size" validate:"gte=0"`
+	GlobalMax         int      `yaml:"global_max" validate:"gte=0"`
+	ReconcileInterval Duration `yaml:"reconcile_interval"`
+	VMMaxAge          Duration `yaml:"vm_max_age"`
+	DrainTimeout      Duration `yaml:"drain_timeout"`
+	BootMaxAttempts   int      `yaml:"boot_max_attempts" validate:"gte=1"`
+
+	// PowerPollInterval is how often the manager polls Proxmox for the
+	// power state of Assigned/Running VMs. When a row's VM is observed
+	// "stopped" (the in-VM gh-runner.service powers off on job
+	// completion), the row is queued for destruction. This replaces
+	// the previous in-VM runner-hook callback channel — Proxmox is
+	// the single source of truth for "is the job over".
+	// Default "3s"; must be > 0.
+	PowerPollInterval Duration `yaml:"power_poll_interval"`
+
+	// VMIDReuseCooldown is the minimum time after a destroy completes
+	// before the allocator may reissue the same VMID. Protects against
+	// PVE-side qmdestroy task settle / lock-file contention when a fresh
+	// clone targets a VMID that Proxmox is still tearing down. Default
+	// "30s"; must be > 0.
+	VMIDReuseCooldown Duration `yaml:"vmid_reuse_cooldown"`
+
+	// OrphanGrace is how long a Proxmox VM may exist without a matching
+	// store row before the GitHub reconciler's sweepProxmoxOrphans
+	// destroys it. Must exceed the typical Clone → guest-agent-ready →
+	// JIT-inject worst case; otherwise the reconciler will destroy
+	// VMs the pool worker is still booting. Default "60s"; must be > 0.
+	OrphanGrace Duration `yaml:"orphan_grace"`
+
+	// CloneInflightGrace is the TTL safety net for the Provisioner's
+	// in-flight clone tracker. Entries older than this are pruned in
+	// case Clone hangs and never returns to clear them. Should be
+	// comfortably longer than the worst-case Clone latency; default
+	// "5m"; must be > 0.
+	CloneInflightGrace Duration `yaml:"clone_inflight_grace"`
+
+	// Schedules is the default schedule set inherited by the
+	// synthesised "default" profile when no profiles: block is
+	// declared. Operators that declare profiles set schedules
+	// per-profile instead — this field is ignored in that case
+	// to keep the override boundary explicit.
+	Schedules []ScheduleConfig `yaml:"schedules,omitempty"`
+}
+
+// ProfileConfig defines a runner profile — a named bundle of hardware
+// shape and per-pool sizing that the scaler routes labelled jobs to.
+//
+// Fields left at their zero value inherit from the global Pool /
+// Proxmox blocks at Resolve time, so the simplest single-profile config
+// only needs `name` + `labels`.
+type ProfileConfig struct {
+	// Name is the profile identifier used in metrics, tags, and the
+	// scaler's routing decisions. Must be unique across Profiles and
+	// match the sanitised-tag character set [a-z0-9-].
+	Name string `yaml:"name" validate:"required"`
+
+	// Labels are the GitHub Actions labels this profile satisfies.
+	// The router (issue #7) picks a profile whose Labels are a
+	// superset of the job's requested labels.
+	Labels []string `yaml:"labels"`
+
+	// TemplateVMID overrides the global proxmox.template_vmid for
+	// this profile. Zero inherits the global value.
+	TemplateVMID int `yaml:"template_vmid"`
+
+	// CPUCores / MemoryMB / DiskGB are per-clone hardware overrides
+	// applied after the clone returns. Zero leaves the template's
+	// default in place.
+	CPUCores int `yaml:"cpu"`
+	MemoryMB int `yaml:"memory_mb"`
+	DiskGB   int `yaml:"disk_gb"`
+
+	// Storage overrides the target storage pool for full clones.
+	// Empty inherits the global proxmox.storage.disk.
+	Storage string `yaml:"storage"`
+
+	// HotSize / WarmSize / MaxConcurrentRunners are per-profile pool
+	// sizes. *int so the unmarshaller can distinguish "field omitted"
+	// (nil — inherit from global pool / scaleset) from "explicit 0"
+	// (e.g. a gpu profile that wants no hot pool, only warm). The
+	// effective values are resolved into the matching *_effective
+	// helpers below at ApplyDefaults time.
+	HotSize              *int `yaml:"hot_size,omitempty" validate:"omitempty,gte=0"`
+	WarmSize             *int `yaml:"warm_size,omitempty" validate:"omitempty,gte=0"`
+	MaxConcurrentRunners *int `yaml:"max_concurrent_runners,omitempty" validate:"omitempty,gte=0"`
+
+	// BootMaxAttempts / VMMaxAge are per-profile recycle/poison knobs.
+	// Nil/empty inherits the global pool defaults. BootMaxAttempts must
+	// be >= 1; accepting 0 would poison every VM in this profile on its
+	// first failed boot. VMMaxAge must be a positive Go duration;
+	// zero/negative is rejected at config-load (Resolve) to avoid
+	// silently disabling age-based recycling. To inherit the fleet
+	// default, omit the field entirely.
+	BootMaxAttempts *int     `yaml:"boot_max_attempts,omitempty" validate:"omitempty,gte=1"`
+	VMMaxAge        Duration `yaml:"vm_max_age"`
+
+	// Network, when non-nil, overrides the global proxmox.network
+	// block for clones of this profile (bridge, VLAN tag, MTU,
+	// optional extra NICs) and selects the IPAM backend. Nil =
+	// inherit the global network unchanged + use the noop IPAM
+	// allocator (cloud-init falls back to DHCP).
+	Network *ProfileNetworkConfig `yaml:"network,omitempty"`
+
+	// CanaryTemplateVMID, when > 0, declares a staging template
+	// for this profile. CanaryPercent% of new clones use it; the
+	// rest use TemplateVMID (the stable template). Boot failures
+	// on canary clones feed a running failure rate; when the
+	// rate exceeds CanaryMaxFailureRate the orchestrator
+	// auto-reverts CanaryPercent to 0 in-process and emits
+	// scaleset_canary_reverted_total. Operators investigate
+	// before re-enabling. See internal/canary for the matching
+	// semantics.
+	CanaryTemplateVMID int `yaml:"canary_template_vmid"`
+
+	// CanaryPercent is the operator's requested canary share,
+	// 0-100. Defaults to 0 (canary disabled).
+	CanaryPercent int `yaml:"canary_percent" validate:"gte=0,lte=100"`
+
+	// CanaryMaxFailureRate is the canary-only failure ratio at
+	// which the auto-revert fires. 0.0 disables the auto-revert
+	// (operator opts for manual control). Range [0.0, 1.0].
+	CanaryMaxFailureRate float64 `yaml:"canary_max_failure_rate" validate:"gte=0,lte=1"`
+
+	// Schedules is an ordered list of cron-driven hot/warm size
+	// overrides for this profile (issue #9). On each fire the
+	// runner calls pool.Manager.SetTargetSizes with the
+	// schedule's HotSize / WarmSize; the override stays in
+	// effect for Duration, then reverts to the profile's
+	// configured HotSize/WarmSize (unless another schedule is
+	// still inside its own window — last-fired wins). Empty
+	// means no schedule overrides.
+	Schedules []ScheduleConfig `yaml:"schedules,omitempty"`
+}
+
+// ScheduleConfig is one cron-driven override. The cron expression
+// uses robfig/cron/v3's standard 5-field syntax (minute hour
+// day-of-month month day-of-week); Timezone defaults to the
+// orchestrator's local time when omitted. Both sizes must be
+// declared explicitly even when the operator only wants to
+// override one — a missing value is too easy to misread as
+// "leave the other alone" (it doesn't; the runner always sets
+// both).
+type ScheduleConfig struct {
+	// Name identifies the schedule for metrics, log lines, and
+	// admin-state output. Required; must be unique within the
+	// owning profile.
+	Name string `yaml:"name" validate:"required"`
+
+	// Cron is the standard 5-field robfig/cron expression.
+	// Examples: "0 8 * * 1-5" (8am weekdays),
+	// "0 0 * * *" (midnight every day).
+	Cron string `yaml:"cron" validate:"required"`
+
+	// Duration is how long after each fire the override stays
+	// active. Must be a positive Go duration string ("10h",
+	// "30m"). When the window closes the runner reverts to
+	// the profile baseline unless another schedule's window
+	// is still open (last-fired wins).
+	Duration Duration `yaml:"duration" validate:"required"`
+
+	// Timezone is an IANA tz name (e.g. "America/New_York").
+	// Empty means UTC — schedules-as-code that read sensibly
+	// under DST shifts.
+	Timezone string `yaml:"timezone,omitempty"`
+
+	// HotSize / WarmSize replace the profile's configured pool
+	// sizes for Duration. Both must be >= 0; the
+	// hot+warm <= max_concurrent_runners invariant is enforced
+	// against the profile's MaxConcurrentRunners at load time.
+	HotSize  int `yaml:"hot_size" validate:"gte=0"`
+	WarmSize int `yaml:"warm_size" validate:"gte=0"`
+
+	// Location and CronSchedule are populated by Resolve.
+	// CronSchedule is the parsed cron expression — exposed so
+	// consumers (the schedule runner in internal/app) don't
+	// have to re-parse and can't drift on the parser
+	// configuration.
+	Location     *time.Location `yaml:"-"`
+	CronSchedule cron.Schedule  `yaml:"-"`
+}
+
+// ProfileNetworkConfig overrides the global Proxmox network for
+// one runner profile. Every field is optional — empty inherits the
+// global proxmox.network.* value the corresponding field maps to.
+type ProfileNetworkConfig struct {
+	// Bridge overrides proxmox.network.bridge for net0. Empty
+	// inherits.
+	Bridge string `yaml:"bridge"`
+
+	// VLANTag overrides proxmox.network.vlan_tag for net0. 0 ==
+	// "use the global default" (which is itself 0 == untagged).
+	// To force untagged on a profile while the global default is
+	// tagged, use the explicit `vlan_untagged: true` knob below.
+	VLANTag int `yaml:"vlan_tag" validate:"gte=0,lte=4094"`
+
+	// VLANUntagged forces net0 untagged regardless of the global
+	// default. Needed because a literal 0 on VLANTag is
+	// indistinguishable from "field omitted".
+	VLANUntagged bool `yaml:"vlan_untagged"`
+
+	// MTU sets the net0 MTU. 0 inherits the bridge default
+	// (usually 1500). Useful for storage VLANs running jumbo
+	// frames (9000).
+	MTU int `yaml:"mtu" validate:"gte=0,lte=9216"`
+
+	// ExtraNICs declares additional NICs beyond net0. Each entry
+	// becomes a net1, net2, ... Proxmox config line. Use case
+	// from issue #6: a storage VLAN or a registry-mirror VLAN
+	// the runner needs to reach in addition to the primary
+	// network.
+	ExtraNICs []ProfileNICConfig `yaml:"extra_nics"`
+
+	// IPAM selects the IP allocator for this profile. Nil/omitted
+	// = noop (DHCP via Proxmox cloud-init). See ipam.Backend for
+	// the values.
+	IPAM *ProfileIPAMConfig `yaml:"ipam,omitempty"`
+}
+
+// ProfileNICConfig describes one additional NIC (net1, net2, ...).
+type ProfileNICConfig struct {
+	Bridge       string `yaml:"bridge" validate:"required"`
+	VLANTag      int    `yaml:"vlan_tag" validate:"gte=0,lte=4094"`
+	VLANUntagged bool   `yaml:"vlan_untagged"`
+	MTU          int    `yaml:"mtu" validate:"gte=0,lte=9216"`
+}
+
+// ProfileIPAMConfig selects the IPAM backend for a profile.
+type ProfileIPAMConfig struct {
+	// Backend is "noop" (default; DHCP fallback) or "static"
+	// (in-memory pool fed by Pool). External-IPAM backends
+	// (NetBox, Infoblox, etc.) are out of scope for this iteration
+	// — add them as separate backends behind the same Allocator
+	// interface.
+	Backend string `yaml:"backend" validate:"required,oneof=noop static"`
+
+	// Pool is the list of CIDR-suffixed IPs the `static` backend
+	// hands out. e.g. ["10.0.0.10/24", "10.0.0.11/24"]. Required
+	// for backend=static; ignored for backend=noop.
+	Pool []string `yaml:"pool,omitempty"`
+}
+
+// HotSizeOrDefault returns the effective hot pool size for the
+// profile, dereferencing the *int and falling back to the supplied
+// default when nil.
+func (p ProfileConfig) HotSizeOrDefault(d int) int { return derefIntDefault(p.HotSize, d) }
+
+// WarmSizeOrDefault returns the effective warm pool size.
+func (p ProfileConfig) WarmSizeOrDefault(d int) int { return derefIntDefault(p.WarmSize, d) }
+
+// MaxConcurrentRunnersOrDefault returns the effective concurrency cap.
+func (p ProfileConfig) MaxConcurrentRunnersOrDefault(d int) int {
+	return derefIntDefault(p.MaxConcurrentRunners, d)
+}
+
+// BootMaxAttemptsOrDefault returns the effective boot-attempts ceiling.
+func (p ProfileConfig) BootMaxAttemptsOrDefault(d int) int {
+	return derefIntDefault(p.BootMaxAttempts, d)
+}
+
+func derefIntDefault(p *int, d int) int {
+	if p == nil {
+		return d
+	}
+	return *p
+}
+
+func intp(v int) *int { return &v }
+
+// ObservabilityConfig configures logging, metrics, and tracing endpoints.
+type ObservabilityConfig struct {
+	HTTPAddr  string        `yaml:"http_addr"`
+	LogLevel  string        `yaml:"log_level" validate:"oneof=debug info warn error"`
+	LogFormat string        `yaml:"log_format" validate:"oneof=json text"`
+	Tracing   TracingConfig `yaml:"tracing"`
+}
+
+// TracingConfig enables OTLP/HTTP trace export. Disabled when Endpoint
+// is empty — the orchestrator then uses a no-op tracer that's free to
+// call but produces no output.
+type TracingConfig struct {
+	// Endpoint is the OTLP/HTTP receiver, e.g. "otel-collector:4318".
+	// Host:port only — the OTLP path ("/v1/traces") is appended by the
+	// exporter.
+	Endpoint string `yaml:"endpoint"`
+
+	// Insecure, when true, uses plain HTTP. Defaults to false (HTTPS).
+	Insecure bool `yaml:"insecure"`
+
+	// SampleRatio in [0.0, 1.0] selects what fraction of root spans to
+	// record. Defaults to 1.0 (record everything) — appropriate for an
+	// orchestrator with low span volume.
+	SampleRatio float64 `yaml:"sample_ratio"`
+}
+
+// AdminAPIConfig configures the admin HTTP API. Optional; disabled when
+// HTTPAddr is empty.
+type AdminAPIConfig struct {
+	HTTPAddr     string `yaml:"http_addr"`
+	SharedSecret string `yaml:"shared_secret" koanf:"shared_secret"`
+
+	// TrustedProxies is the list of CIDR ranges from which the admin
+	// server will honor X-Forwarded-For / X-Real-IP headers when
+	// deriving the source IP for per-IP rate limiting. Requests from
+	// peers outside this list have their forwarded-for headers ignored
+	// — the immediate TCP peer's IP is used instead, so an attacker
+	// cannot spoof the source IP via a header.
+	//
+	// Defaults to loopback only ("127.0.0.0/8", "::1/128") at
+	// ApplyDefaults time, which is correct for the standalone case and
+	// for raft deployments where the Forwarder is always on the same
+	// pod. Operators terminating TLS via an in-cluster proxy should
+	// add that proxy's CIDR explicitly.
+	TrustedProxies []string `yaml:"trusted_proxies"`
+
+	// TLS turns on https for the admin HTTP server and the standby
+	// Forwarder dial. Nil = plain HTTP (back-compat, only safe on a
+	// cluster-internal ClusterIP/NodePort). Set CAFile to enable mTLS
+	// — standbys then present a client cert and the leader verifies
+	// it; without CAFile the connection is one-way TLS.
+	TLS *TLSConfig `yaml:"tls"`
+}
+
+// TLSConfig is a reusable PEM-on-disk TLS bundle. Both server and
+// client sides of an inter-replica transport reuse it: the server
+// presents (CertFile, KeyFile) and (when CAFile is set) verifies
+// presented client certs against it; the client presents the same
+// (CertFile, KeyFile) as its client cert.
+type TLSConfig struct {
+	// CertFile is the PEM-encoded server (and client, for mTLS) cert
+	// chain. Required when TLSConfig is non-nil.
+	CertFile string `yaml:"cert_file" validate:"required"`
+
+	// KeyFile is the PEM-encoded private key matching CertFile.
+	// Required when TLSConfig is non-nil.
+	KeyFile string `yaml:"key_file" validate:"required"`
+
+	// CAFile is the PEM-encoded CA bundle used to verify the peer's
+	// cert. Empty = one-way TLS (no client-cert verification on
+	// either side). Set on both replicas for full mTLS.
+	CAFile string `yaml:"ca_file,omitempty"`
+
+	// InsecureSkipVerify disables peer-cert verification. Intended for
+	// lab use; refuse to set in production unless paired with a
+	// well-understood lab environment.
+	InsecureSkipVerify bool `yaml:"insecure_skip_verify,omitempty"`
+}
+
+// ClusterConfig selects the leader-election backend. In "standalone"
+// mode (the default) the process is always leader; multi-replica
+// deployment is unsupported. In "raft" mode the process participates
+// in an embedded hashicorp/raft cluster across the peers declared in
+// Raft.Peers and only runs the control plane while it holds raft
+// leadership.
+type ClusterConfig struct {
+	// Mode is "standalone" (default) or "raft".
+	Mode string `yaml:"mode" validate:"oneof=standalone raft"`
+
+	// Raft is only consulted when Mode == "raft".
+	Raft ClusterRaftConfig `yaml:"raft"`
+}
+
+// ClusterRaftConfig configures the embedded raft coordinator. The
+// orchestrator runs raft purely as a leader-election primitive — the
+// FSM is a no-op and no state is replicated. Operators declare the
+// full peer list once; dynamic membership changes are not supported.
+type ClusterRaftConfig struct {
+	// NodeID uniquely identifies this replica in the raft
+	// configuration. Must match exactly one entry in Peers.NodeID.
+	// Defaults to $HOSTNAME, then os.Hostname.
+	NodeID string `yaml:"node_id"`
+
+	// BindAddr is the listen address for the raft TCP transport,
+	// e.g. "0.0.0.0:7000". Required.
+	BindAddr string `yaml:"bind_addr"`
+
+	// AdvertiseAddr is what other peers use to dial this replica's
+	// raft port, e.g. "10.0.0.1:7000". When empty, falls back to
+	// BindAddr — only safe when BindAddr is a routable (non-wildcard)
+	// address.
+	AdvertiseAddr string `yaml:"advertise_addr"`
+
+	// DataDir is the on-disk directory where raft persists its log,
+	// stable, and snapshot stores. Raft's election-safety invariants
+	// (currentTerm, votedFor) require these to survive restart: with
+	// in-memory stores, a partition + restart in the wrong window
+	// could let two replicas each believe they are leader for the
+	// same term. Required when cluster.mode=raft.
+	DataDir string `yaml:"data_dir"`
+
+	// Peers is the full static peer list, including this replica.
+	// All replicas must agree on this list at startup.
+	Peers []ClusterRaftPeer `yaml:"peers"`
+
+	// Bootstrap, when true, makes this replica call
+	// raft.BootstrapCluster on first start. Should be true on exactly
+	// one replica during initial cluster setup. Safe to leave true on
+	// subsequent restarts — with persistent stores (data_dir set) raft
+	// detects existing state and skips re-bootstrap.
+	Bootstrap bool `yaml:"bootstrap"`
+
+	HeartbeatTimeout Duration `yaml:"heartbeat_timeout"` // default 1s
+	ElectionTimeout  Duration `yaml:"election_timeout"`  // default 1s
+	CommitTimeout    Duration `yaml:"commit_timeout"`    // default 50ms
+
+	// TLS, when set, enables a TLS stream layer on the raft TCP
+	// transport so peer-to-peer raft RPCs (AppendEntries, etc.) are
+	// encrypted. Set CAFile to enable mTLS — each peer presents its
+	// own cert and verifies the other against the bundle. Without
+	// TLS the raft transport is plain TCP — only safe on a private
+	// network operators trust end-to-end.
+	TLS *TLSConfig `yaml:"tls"`
+
+	// Resolved durations (populated by Resolve).
+	HeartbeatTimeoutD time.Duration `yaml:"-"`
+	ElectionTimeoutD  time.Duration `yaml:"-"`
+	CommitTimeoutD    time.Duration `yaml:"-"`
+}
+
+// ClusterRaftPeer describes one replica in the raft cluster. NodeID +
+// RaftAddr uniquely identify the peer to raft; HTTPAddr is what
+// standbys reverse-proxy admin requests to once that peer becomes
+// leader.
+type ClusterRaftPeer struct {
+	NodeID   string `yaml:"node_id" validate:"required"`
+	RaftAddr string `yaml:"raft_addr" validate:"required"`
+	HTTPAddr string `yaml:"http_addr"`
+}
+
+// Load reads, parses, defaults, env-resolves, and validates a YAML config
+// file. The returned Config is ready to use by the rest of the
+// orchestrator; on error the partially-parsed Config is discarded.
+func Load(path string) (*Config, error) {
+	// The config file holds the Proxmox API token, GitHub webhook
+	// secret, and admin bearer — the same class of credential the App
+	// PEM already protects. Refuse to read when the file is world- or
+	// group-readable (mode > 0o600) or owned by a UID other than the
+	// process's effective UID. Surfacing the misconfiguration at
+	// startup is better than after the secret has been exfiltrated.
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("config: stat %s: %w", path, err)
+	}
+	if err := fileperm.CheckMode(info, path, 0o600); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	if err := fileperm.CheckOwnership(info, path); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	// koanf's file provider re-reads the file inside k.Load. The
+	// fileperm checks above gate the read so a too-permissive PEM
+	// can't be silently slurped.
+	return loadInto(koanffile.Provider(path))
+}
+
+// Parse is the in-memory equivalent of [Load]. Useful for tests.
+//
+// Load order, with later layers overriding earlier ones:
+//
+//  1. YAML file (bytes argument).
+//  2. SCALESET_*-prefixed env vars, mapped to koanf keys via the
+//     reflect-built schema map.
+//
+// Any unknown YAML key (typo) fails the load — same as the pre-koanf
+// loader's KnownFields(true) behaviour. Unknown SCALESET_* env vars are
+// silently ignored: env is often the wrong place to enforce schema, and
+// host-level env pollution shouldn't crash the orchestrator.
+func Parse(data []byte) (*Config, error) {
+	return loadInto(koanfrawbytes.Provider(data))
+}
+
+// loadInto is the shared koanf pipeline for both Load() (file provider)
+// and Parse() (raw-bytes provider). Producing identical behaviour from
+// both entry points was non-trivial under the pre-koanf bespoke loader;
+// here it's a parameter.
+func loadInto(yamlProvider koanf.Provider) (*Config, error) {
+	k := koanf.New(".")
+	if err := k.Load(yamlProvider, koanfyaml.Parser()); err != nil {
+		return nil, fmt.Errorf("config: parse yaml: %w", err)
+	}
+	if err := rejectUnknownYAMLKeys(k); err != nil {
+		return nil, err
+	}
+
+	// Capture SCALESET_*-prefixed env vars whose names don't map to any
+	// schema key, so the caller can warn at startup. The env.Provider
+	// only invokes this transform for already-prefixed names (the
+	// Prefix option filters first), so the closure is bounded to the
+	// operator's intentional overrides.
+	var unknownEnv []string
+	envProv := koanfenv.Provider(".", koanfenv.Opt{
+		Prefix: envPrefix,
+		TransformFunc: func(name, value string) (string, any) {
+			if key, ok := schemaEnvMap[name]; ok {
+				return key, value
+			}
+			unknownEnv = append(unknownEnv, name)
+			return "", nil
+		},
+	})
+	if err := k.Load(envProv, nil); err != nil {
+		return nil, fmt.Errorf("config: load env: %w", err)
+	}
+
+	var cfg Config
+	if err := k.UnmarshalWithConf("", &cfg, koanf.UnmarshalConf{
+		Tag: "yaml",
+		DecoderConfig: &mapstructure.DecoderConfig{
+			// TextUnmarshallerHookFunc lets the [Duration] type
+			// parse its YAML string itself; without the hook
+			// mapstructure would try to descend into Duration's
+			// unexported fields and silently produce zero values.
+			DecodeHook: mapstructure.ComposeDecodeHookFunc(
+				mapstructure.TextUnmarshallerHookFunc(),
+				mapstructure.StringToTimeDurationHookFunc(),
+				mapstructure.StringToSliceHookFunc(","),
+			),
+			Result:           &cfg,
+			WeaklyTypedInput: true,
+		},
+	}); err != nil {
+		return nil, fmt.Errorf("config: unmarshal: %w", err)
+	}
+	cfg.unknownEnvOverrides = unknownEnv
+	// Mixing-rejection (issue #1): scalesets: is the new shape;
+	// scaleset: + top-level profiles: + github.scope are the
+	// legacy singular shape. Mixing the two leaves the
+	// orchestrator with two competing sources of truth — reject
+	// at load before ApplyDefaults silently merges them.
+	if len(cfg.Scalesets) > 0 {
+		var mixed []string
+		if cfg.ScaleSet.Name != "" || cfg.ScaleSet.MaxConcurrentRunners != 0 {
+			mixed = append(mixed, "scaleset:")
+		}
+		if len(cfg.Profiles) > 0 {
+			mixed = append(mixed, "profiles:")
+		}
+		if cfg.GitHub.Scope.Org != "" || cfg.GitHub.Scope.Repo != "" {
+			mixed = append(mixed, "github.scope:")
+		}
+		if len(mixed) > 0 {
+			return nil, fmt.Errorf("config: scalesets: declared alongside legacy %v — remove the legacy fields or remove scalesets: (mixing is ambiguous)", mixed)
+		}
+	}
+	cfg.ApplyDefaults()
+	if err := cfg.Resolve(); err != nil {
+		return nil, fmt.Errorf("config: resolve: %w", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("config: validate: %w", err)
+	}
+	return &cfg, nil
+}
+
+// rejectUnknownYAMLKeys preserves the pre-koanf loader's strict-mode
+// behaviour: any YAML key not in the Config schema fails the load with
+// a clear error pointing at the offending key. Without this, an
+// operator typo (`pool.hot_sze: 5`) would silently no-op.
+func rejectUnknownYAMLKeys(k *koanf.Koanf) error {
+	for _, key := range k.Keys() {
+		if !isSchemaKey(key) {
+			return fmt.Errorf("config: unknown yaml key %q", key)
+		}
+	}
+	return nil
+}
+
+// schemaEnvMap maps SCALESET_-prefixed env names to koanf key paths.
+// schemaKeySet is the union of all valid koanf key paths reachable
+// from the Config struct, used by rejectUnknownYAMLKeys.
+//
+// Both are built once at package init by walking the Config struct's
+// yaml tags. List-of-struct paths (e.g. profiles[].name) are tracked
+// by their list head only; per-element keys round-trip through koanf
+// unmarshal without needing a per-index env mapping (the env override
+// surface for slice-of-struct is intentionally limited).
+var (
+	schemaEnvMap map[string]string
+	schemaKeySet map[string]struct{}
+)
+
+func init() {
+	schemaEnvMap = make(map[string]string)
+	schemaKeySet = make(map[string]struct{})
+	walkSchema(reflect.TypeOf(Config{}), "", false)
+}
+
+// walkSchema recursively visits every yaml-tagged field on the
+// Config struct (including nested struct + slice-of-struct fields)
+// and registers each path into schemaKeySet. Top-level paths also
+// register an envPrefix-derived alias into schemaEnvMap.
+//
+// inSliceElem distinguishes top-level recursion (env-mapping
+// enabled) from per-element walks of a slice-of-struct field
+// (schema-key-set only). Env-override of slice elements would
+// require per-index env names, which is intentionally unsupported.
+//
+// Pointer types are unwrapped so optional config blocks declared
+// as `*FooConfig` still get their fields registered.
+func walkSchema(t reflect.Type, prefix string, inSliceElem bool) {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return
+	}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag := strings.Split(f.Tag.Get("yaml"), ",")[0]
+		if tag == "" || tag == "-" {
+			continue
+		}
+		key := tag
+		if prefix != "" {
+			key = prefix + "." + tag
+		}
+		schemaKeySet[key] = struct{}{}
+		if !inSliceElem {
+			envName := envPrefix + strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
+			schemaEnvMap[envName] = key
+		}
+
+		ft := f.Type
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		switch ft.Kind() { //nolint:exhaustive // only struct + slice-of-struct need recursion; other kinds are leaves
+		case reflect.Struct:
+			walkSchema(ft, key, inSliceElem)
+		case reflect.Slice:
+			elem := ft.Elem()
+			if elem.Kind() == reflect.Pointer {
+				elem = elem.Elem()
+			}
+			if elem.Kind() == reflect.Struct {
+				// Slice-of-struct: register element field key paths so a
+				// typo'd YAML key inside (e.g. profiles[0].nme) still
+				// fails the strict-mode walk. Per-element walks skip the
+				// env-mapping side because there's no stable per-index
+				// env name.
+				walkSchema(elem, key, true)
+			}
+		}
+	}
+}
+
+// isSchemaKey reports whether the given koanf key path corresponds to
+// a declared field in the Config schema. Per-index slice keys are
+// stripped of their numeric index before lookup so e.g.
+// "profiles.0.name" matches the registered "profiles.name".
+func isSchemaKey(key string) bool {
+	if _, ok := schemaKeySet[key]; ok {
+		return true
+	}
+	stripped := stripSliceIndices(key)
+	_, ok := schemaKeySet[stripped]
+	return ok
+}
+
+// stripSliceIndices removes numeric path components from a koanf key,
+// collapsing "profiles.0.network.extra_nics.1.bridge" to
+// "profiles.network.extra_nics.bridge" — the form buildSchema records.
+func stripSliceIndices(key string) string {
+	parts := strings.Split(key, ".")
+	out := parts[:0]
+	for _, p := range parts {
+		if _, err := strconv.Atoi(p); err == nil {
+			continue
+		}
+		out = append(out, p)
+	}
+	return strings.Join(out, ".")
+}
+
+// defaultProfileName is the synthetic profile name used when no
+// `profiles:` block is declared. Kept aligned with tags.DefaultProfile;
+// this package does not import tags to avoid a circular reference.
+const defaultProfileName = "default"
+
+// ApplyDefaults fills in sane defaults for optional fields.
+func (c *Config) ApplyDefaults() {
+	// Pool
+	c.Pool.ReconcileInterval.setDefault(10 * time.Second)
+	c.Pool.VMMaxAge.setDefault(24 * time.Hour)
+	c.Pool.DrainTimeout.setDefault(30 * time.Minute)
+	if c.Pool.BootMaxAttempts == 0 {
+		c.Pool.BootMaxAttempts = 3
+	}
+	c.Pool.PowerPollInterval.setDefault(3 * time.Second)
+	c.Pool.VMIDReuseCooldown.setDefault(30 * time.Second)
+	c.Pool.OrphanGrace.setDefault(60 * time.Second)
+	c.Pool.CloneInflightGrace.setDefault(5 * time.Minute)
+	// Observability
+	if c.Observability.HTTPAddr == "" {
+		c.Observability.HTTPAddr = ":9100"
+	}
+	if c.Observability.LogLevel == "" {
+		c.Observability.LogLevel = "info"
+	}
+	if c.Observability.LogFormat == "" {
+		c.Observability.LogFormat = "json"
+	}
+	// GitHub reconciler defaults — tuned around the production failure
+	// mode (over-provisioned runners that GitHub never assigns).
+	c.GitHub.PollInterval.setDefault(15 * time.Second)
+	c.GitHub.AssignedGrace.setDefault(5 * time.Minute)
+	c.GitHub.RunningIdleGrace.setDefault(30 * time.Second)
+	c.GitHub.AssignedOfflineGrace.setDefault(2 * time.Minute)
+	// Proxmox.Clone default is captured in CloneConfig.LinkedOrDefault.
+	// Cluster
+	if c.Cluster.Mode == "" {
+		c.Cluster.Mode = "standalone"
+	}
+	c.Cluster.Raft.HeartbeatTimeout.setDefault(1 * time.Second)
+	c.Cluster.Raft.ElectionTimeout.setDefault(1 * time.Second)
+	c.Cluster.Raft.CommitTimeout.setDefault(50 * time.Millisecond)
+	// Admin API: default trusted-proxy list to loopback. Operators
+	// terminating TLS via an in-cluster proxy can override; raft
+	// deployments where the Forwarder lives on the same pod are
+	// covered by the default.
+	if c.AdminAPI.TrustedProxies == nil {
+		c.AdminAPI.TrustedProxies = []string{"127.0.0.0/8", "::1/128"}
+	}
+	// Multi-scaleset normalisation (issue #1):
+	//   - If the operator wrote the legacy singular form
+	//     (`scaleset:` + top-level `profiles:` + `github.scope`),
+	//     fold it into a 1-element Scalesets list.
+	//   - Mutually-exclusive use (both forms together) is caught
+	//     by Validate; ApplyDefaults's job is normalisation, not
+	//     enforcement.
+	//   - After this block, Scalesets is the source of truth.
+	//     The legacy ScaleSet / top-level Profiles / GitHub.Scope
+	//     fields are kept populated as projections of
+	//     Scalesets[0] for backwards-compatible call sites that
+	//     haven't been migrated yet.
+	if len(c.Scalesets) == 0 && (c.ScaleSet.Name != "" || c.ScaleSet.MaxConcurrentRunners != 0) {
+		c.Scalesets = []ScaleSetEntry{{
+			Name:                 c.ScaleSet.Name,
+			Labels:               append([]string(nil), c.ScaleSet.Labels...),
+			RunnerGroup:          c.ScaleSet.RunnerGroup,
+			MaxConcurrentRunners: c.ScaleSet.MaxConcurrentRunners,
+			Scope:                c.GitHub.Scope,
+			Profiles:             append([]ProfileConfig(nil), c.Profiles...),
+		}}
+	}
+	// Per-scaleset profile defaulting: synthesise a single
+	// "default" profile when an entry omits Profiles, and
+	// inherit unset sizing knobs from the global Pool block.
+	for si := range c.Scalesets {
+		s := &c.Scalesets[si]
+		if len(s.Profiles) == 0 {
+			s.Profiles = []ProfileConfig{{
+				Name:                 defaultProfileName,
+				Labels:               append([]string(nil), s.Labels...),
+				HotSize:              intp(c.Pool.HotSize),
+				WarmSize:             intp(c.Pool.WarmSize),
+				MaxConcurrentRunners: intp(s.MaxConcurrentRunners),
+				BootMaxAttempts:      intp(c.Pool.BootMaxAttempts),
+				VMMaxAge:             c.Pool.VMMaxAge,
+				Schedules:            append([]ScheduleConfig(nil), c.Pool.Schedules...),
+			}}
+			continue
+		}
+		for i := range s.Profiles {
+			p := &s.Profiles[i]
+			if p.HotSize == nil {
+				p.HotSize = intp(c.Pool.HotSize)
+			}
+			if p.WarmSize == nil {
+				p.WarmSize = intp(c.Pool.WarmSize)
+			}
+			if p.MaxConcurrentRunners == nil {
+				p.MaxConcurrentRunners = intp(s.MaxConcurrentRunners)
+			}
+			if p.BootMaxAttempts == nil {
+				p.BootMaxAttempts = intp(c.Pool.BootMaxAttempts)
+			}
+			if !p.VMMaxAge.Set() {
+				p.VMMaxAge = c.Pool.VMMaxAge
+			}
+		}
+	}
+	// Backwards-compat projection: when exactly one scaleset is
+	// declared (the singular-form case, or a new multi-scaleset
+	// config that happens to use 1 entry), keep ScaleSet /
+	// Profiles / GitHub.Scope populated as projections so call
+	// sites that still read the legacy fields continue to work.
+	// With N > 1 these legacy fields stay zero — those call
+	// sites must be migrated to iterate over Scalesets.
+	if len(c.Scalesets) == 1 {
+		s := c.Scalesets[0]
+		c.ScaleSet = s.asScaleSetConfig()
+		c.Profiles = append([]ProfileConfig(nil), s.Profiles...)
+		c.GitHub.Scope = s.Scope
+	}
+}
+
+// validateGitHubURLs enforces the shared config_url / config_base_url
+// rules across both the PAT and App auth blocks (issue #214). Both
+// blocks have the same per-scope routing semantics for GHES so the
+// checks are identical apart from the field-name prefix.
+func validateGitHubURLs(prefix, configURL, configBaseURL string, numScalesets int) error {
+	if configURL != "" && configBaseURL != "" {
+		return fmt.Errorf("%s: config_url and config_base_url are mutually exclusive — set one or neither", prefix)
+	}
+	if configURL != "" && numScalesets > 1 {
+		return fmt.Errorf("%s.config_url is incompatible with multi-scaleset (%d scalesets declared); use %s.config_base_url so each scaleset's scope produces the right per-scope URL",
+			prefix, numScalesets, prefix)
+	}
+	return nil
+}
+
+// Resolve enforces cross-field invariants and parses duration strings
+// into [time.Duration]. Call before [Validate].
+//
+// Secrets are no longer env-resolved here — koanf's env layer in Parse
+// already populated them. Resolve only checks that the required secret
+// fields are non-empty after the koanf merge.
+func (c *Config) Resolve() error {
+	// GitHub PAT token — must be present when PAT auth is selected.
+	if c.GitHub.PAT != nil {
+		if c.GitHub.PAT.Token == "" {
+			return errors.New("github.pat.token: required (set via yaml or SCALESET_GITHUB_PAT_TOKEN)")
+		}
+		if err := validateGitHubURLs("github.pat", c.GitHub.PAT.ConfigURL, c.GitHub.PAT.ConfigBaseURL, len(c.Scalesets)); err != nil {
+			return err
+		}
+	}
+	// GitHub App: exactly one of client_id / app_id.
+	if c.GitHub.App != nil {
+		hasClient := c.GitHub.App.ClientID != ""
+		hasAppID := c.GitHub.App.AppID > 0
+		switch {
+		case hasClient && hasAppID:
+			return errors.New("github.app: set exactly one of client_id or app_id (both are present)")
+		case !hasClient && !hasAppID:
+			return errors.New("github.app: set exactly one of client_id or app_id (both are empty)")
+		}
+		if err := validateGitHubURLs("github.app", c.GitHub.App.ConfigURL, c.GitHub.App.ConfigBaseURL, len(c.Scalesets)); err != nil {
+			return err
+		}
+	}
+	// GitHub scope: with N > 1 scalesets the legacy github.scope
+	// is meaningless (each scaleset has its own scope, validated
+	// by validateScalesets). Only enforce the legacy invariant
+	// when at most one scaleset is declared — in which case
+	// ApplyDefaults projected the scope into c.GitHub.Scope.
+	if len(c.Scalesets) <= 1 {
+		switch {
+		case c.GitHub.Scope.Org == "" && c.GitHub.Scope.Repo == "":
+			return errors.New("github.scope: exactly one of org or repo must be set (both are empty)")
+		case c.GitHub.Scope.Org != "" && c.GitHub.Scope.Repo != "":
+			return errors.New("github.scope: exactly one of org or repo must be set (both are present)")
+		}
+	}
+	// Proxmox API token secret — always required.
+	if c.Proxmox.Auth.TokenSecret == "" {
+		return errors.New("proxmox.auth.token_secret: required (set via yaml or SCALESET_PROXMOX_AUTH_TOKEN_SECRET)")
+	}
+	// Proxmox NIC bridge alphabet check — same regex as
+	// validateProfileNetworks applies to the global net0 bridge
+	// (issue #284). VLANTag is already bounded by the struct tag;
+	// MTU has no field on the global ProxmoxNetwork.
+	if err := validateNIC("proxmox.network", c.Proxmox.Network.Bridge, c.Proxmox.Network.VLANTag, 0); err != nil {
+		return err
+	}
+	// Admin API shared secret — optional at config-load (the admin API
+	// itself refuses to start with an empty secret when HTTPAddr is
+	// set; see adminapi.Serve and #146 for the loud failure mode).
+	// Node selector consistency.
+	switch c.Nodes.Strategy {
+	case "single":
+		if c.Nodes.SingleNode == "" {
+			return errors.New("nodes.single_node is required when strategy=single")
+		}
+	case "round_robin", "least_loaded":
+		if len(c.Nodes.Members) == 0 {
+			return fmt.Errorf("nodes.members is required when strategy=%s", c.Nodes.Strategy)
+		}
+	}
+	// Duration knobs that must be strictly positive. ApplyDefaults
+	// already substituted defaults for unset fields; the only way to
+	// fail here is an explicit non-positive value in YAML/env (e.g.
+	// `power_poll_interval: 0s`).
+	if c.Pool.PowerPollInterval.D() <= 0 {
+		return errors.New("pool.power_poll_interval must be positive")
+	}
+	if c.Pool.VMIDReuseCooldown.D() <= 0 {
+		return errors.New("pool.vmid_reuse_cooldown must be positive")
+	}
+	if c.Pool.OrphanGrace.D() <= 0 {
+		return errors.New("pool.orphan_grace must be positive")
+	}
+	if c.Pool.CloneInflightGrace.D() <= 0 {
+		return errors.New("pool.clone_inflight_grace must be positive")
+	}
+	// Profiles: per-profile vm_max_age must be positive when set.
+	// Empty inherits from pool (already applied in ApplyDefaults, so
+	// the inherit normally round-trips a positive default).
+	for si := range c.Scalesets {
+		s := &c.Scalesets[si]
+		for i := range s.Profiles {
+			p := &s.Profiles[i]
+			if !p.VMMaxAge.Set() {
+				continue
+			}
+			if p.VMMaxAge.D() <= 0 {
+				return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: vm_max_age must be positive",
+					si, s.Name, i, p.Name)
+			}
+		}
+	}
+	// Keep the legacy projection in sync for backwards-compat
+	// callers reading c.Profiles directly.
+	if len(c.Scalesets) >= 1 {
+		c.Profiles = append([]ProfileConfig(nil), c.Scalesets[0].Profiles...)
+	}
+	// Profile schedules: parse Duration + Timezone + validate cron
+	// expression so misconfiguration surfaces at load rather than at
+	// the first cron tick.
+	for i := range c.Profiles {
+		p := &c.Profiles[i]
+		if err := resolveSchedules(p.Schedules, fmt.Sprintf("profiles[%d] %q", i, p.Name)); err != nil {
+			return err
+		}
+	}
+	// Cluster.
+	if err := c.resolveCluster(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// resolveCluster fills in NodeID from $HOSTNAME/os.Hostname when
+// empty, parses raft timing durations, and validates that "raft"
+// mode has a self-consistent peer list.
+func (c *Config) resolveCluster() error {
+	r := &c.Cluster.Raft
+	if r.NodeID == "" {
+		if id := os.Getenv("HOSTNAME"); id != "" {
+			r.NodeID = id
+		} else if host, err := os.Hostname(); err == nil {
+			r.NodeID = host
+		}
+	}
+	// Raft timing knobs are parsed by the Duration type's
+	// UnmarshalText; ApplyDefaults supplies defaults when omitted.
+	// No additional parsing needed here.
+	if c.Cluster.Mode != "raft" {
+		return nil
+	}
+	switch {
+	case r.NodeID == "":
+		return errors.New("cluster.raft.node_id is required (set the field, $HOSTNAME, or have a usable hostname) when cluster.mode=raft")
+	case r.BindAddr == "":
+		return errors.New("cluster.raft.bind_addr is required when cluster.mode=raft")
+	case len(r.Peers) == 0:
+		return errors.New("cluster.raft.peers must list every replica (including this one) when cluster.mode=raft")
+	}
+	selfFound := false
+	seen := make(map[string]struct{}, len(r.Peers))
+	for i, p := range r.Peers {
+		if p.NodeID == "" {
+			return fmt.Errorf("cluster.raft.peers[%d].node_id is required", i)
+		}
+		if _, dup := seen[p.NodeID]; dup {
+			return fmt.Errorf("cluster.raft.peers: duplicate node_id %q", p.NodeID)
+		}
+		seen[p.NodeID] = struct{}{}
+		if p.RaftAddr == "" {
+			return fmt.Errorf("cluster.raft.peers[%d].raft_addr is required", i)
+		}
+		if p.NodeID == r.NodeID {
+			selfFound = true
+		}
+	}
+	if !selfFound {
+		return fmt.Errorf("cluster.raft.peers does not include this replica's node_id %q", r.NodeID)
+	}
+	if r.DataDir == "" {
+		return errors.New("cluster.raft.data_dir is required when cluster.mode=raft (raft consensus state must survive restart)")
+	}
+	return nil
+}
+
+// Validate runs the struct-tag validator and any cross-field checks not
+// expressible in tags.
+func (c *Config) Validate() error {
+	v := validator.New(validator.WithRequiredStructEnabled())
+	if err := v.Struct(c); err != nil {
+		return err
+	}
+	if c.Pool.HotSize+c.Pool.WarmSize > c.ScaleSet.MaxConcurrentRunners {
+		return fmt.Errorf("pool.hot_size+pool.warm_size (%d) must not exceed scaleset.max_concurrent_runners (%d)",
+			c.Pool.HotSize+c.Pool.WarmSize, c.ScaleSet.MaxConcurrentRunners)
+	}
+	if c.Proxmox.TemplateVMID >= c.Proxmox.VMIDRange.Min && c.Proxmox.TemplateVMID <= c.Proxmox.VMIDRange.Max {
+		return fmt.Errorf("proxmox.template_vmid (%d) must be outside vmid_range [%d, %d]",
+			c.Proxmox.TemplateVMID, c.Proxmox.VMIDRange.Min, c.Proxmox.VMIDRange.Max)
+	}
+	// The Proxmox API token is sent in a header on every request; require
+	// https:// so the credential never traverses the wire in cleartext.
+	u, err := url.Parse(c.Proxmox.Endpoint)
+	if err != nil || u.Scheme != "https" {
+		return errors.New("proxmox.endpoint must use https:// (the API token is sent on every request and would leak in cleartext over http)")
+	}
+	for _, cidr := range c.AdminAPI.TrustedProxies {
+		if _, err := netip.ParsePrefix(cidr); err != nil {
+			return fmt.Errorf("admin_api.trusted_proxies: invalid CIDR %q: %w", cidr, err)
+		}
+	}
+	if c.AdminAPI.TLS != nil {
+		if err := c.AdminAPI.TLS.validate("admin_api.tls"); err != nil {
+			return err
+		}
+	}
+	if c.Cluster.Raft.TLS != nil {
+		if err := c.Cluster.Raft.TLS.validate("cluster.raft.tls"); err != nil {
+			return err
+		}
+	}
+	if err := c.validateScalesets(); err != nil {
+		return err
+	}
+	if err := c.validateProfiles(); err != nil {
+		return err
+	}
+	if err := c.validateQuotas(); err != nil {
+		return err
+	}
+	if err := c.validatePriority(); err != nil {
+		return err
+	}
+	if err := c.validateNodeAffinity(); err != nil {
+		return err
+	}
+	if err := c.validateProfileNetworks(); err != nil {
+		return err
+	}
+	if err := c.validateProfileCanaries(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateScalesets enforces the multi-scaleset invariants
+// (issue #1): at least one scaleset is declared, no two
+// entries share a Name or Scope, and each entry's
+// hot+warm <= max_concurrent_runners.
+//
+// NOTE: at runtime the orchestrator currently supports only one
+// active scaleset. Configurations with len(Scalesets) > 1 parse
+// and validate cleanly (so operators can stage the YAML form
+// for a future release) but are rejected at runtime by
+// app.Run with a clear migration message. The runtime fan-out
+// across N scalesets is tracked as a follow-up to issue #1.
+func (c *Config) validateScalesets() error {
+	if len(c.Scalesets) == 0 {
+		return errors.New("scalesets: at least one scale set must be declared (or use the legacy singular `scaleset:` form)")
+	}
+	seenName := make(map[string]int, len(c.Scalesets))
+	seenScope := make(map[string]int, len(c.Scalesets))
+	for i, s := range c.Scalesets {
+		if prev, dup := seenName[s.Name]; dup {
+			return fmt.Errorf("scalesets: duplicate name %q at indexes %d and %d", s.Name, prev, i)
+		}
+		seenName[s.Name] = i
+
+		hasOrg := s.Scope.Org != ""
+		hasRepo := s.Scope.Repo != ""
+		switch {
+		case hasOrg && hasRepo:
+			return fmt.Errorf("scalesets[%d] %q.scope: exactly one of org or repo must be set (both are present)", i, s.Name)
+		case !hasOrg && !hasRepo:
+			return fmt.Errorf("scalesets[%d] %q.scope: exactly one of org or repo must be set (both are empty)", i, s.Name)
+		}
+		scopeKey := "org:" + s.Scope.Org + "|repo:" + s.Scope.Repo
+		if prev, dup := seenScope[scopeKey]; dup {
+			return fmt.Errorf("scalesets: %q and %q share the same scope (org=%q repo=%q) — two scale sets cannot register against the same GitHub target",
+				c.Scalesets[prev].Name, s.Name, s.Scope.Org, s.Scope.Repo)
+		}
+		seenScope[scopeKey] = i
+
+		if c.Pool.HotSize+c.Pool.WarmSize > s.MaxConcurrentRunners {
+			return fmt.Errorf("scalesets[%d] %q: pool.hot_size+pool.warm_size (%d) must not exceed max_concurrent_runners (%d)",
+				i, s.Name, c.Pool.HotSize+c.Pool.WarmSize, s.MaxConcurrentRunners)
+		}
+	}
+	if err := c.validateScalesetVMIDRanges(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateScalesetVMIDRanges enforces the disjoint per-scaleset
+// VMID partitioning required by issue #222. Each scaleset's
+// pool.Manager runs its own allocator unaware of siblings, so
+// overlap means two managers will race to clone the same VMID
+// and one will lose to a Proxmox "already exists" error.
+//
+// Rules:
+//
+//   - With exactly one scaleset, inheriting cfg.Proxmox.VMIDRange
+//     is fine — there is no sibling to collide with.
+//   - With N > 1, every scaleset must declare its OWN vmid_range
+//     (inheriting the global would produce N copies of the same
+//     range). The error message points operators at the
+//     migration path.
+//   - Declared per-scaleset ranges must be in-bounds, well-
+//     formed (min > 0, max > min), and pairwise non-overlapping.
+//   - Declared ranges may overlap the global cfg.Proxmox.VMIDRange
+//     — operators sometimes use a wide global range and slice it
+//     into per-scaleset chunks.
+func (c *Config) validateScalesetVMIDRanges() error {
+	type bounded struct {
+		name     string
+		min, max int
+	}
+	declared := make([]bounded, 0, len(c.Scalesets))
+	for i, s := range c.Scalesets {
+		if s.VMIDRange == nil {
+			if len(c.Scalesets) > 1 {
+				return fmt.Errorf("scalesets[%d] %q: vmid_range is required with multi-scaleset (%d scalesets declared) — every scaleset's pool.Manager runs an independent VMID allocator, so inheriting one shared cfg.proxmox.vmid_range across all of them produces clone collisions on Proxmox (issue #222)",
+					i, s.Name, len(c.Scalesets))
+			}
+			continue
+		}
+		if s.VMIDRange.Min <= 0 {
+			return fmt.Errorf("scalesets[%d] %q.vmid_range: min must be > 0 (got %d)", i, s.Name, s.VMIDRange.Min)
+		}
+		if s.VMIDRange.Max <= s.VMIDRange.Min {
+			return fmt.Errorf("scalesets[%d] %q.vmid_range: max (%d) must be greater than min (%d)",
+				i, s.Name, s.VMIDRange.Max, s.VMIDRange.Min)
+		}
+		declared = append(declared, bounded{name: s.Name, min: s.VMIDRange.Min, max: s.VMIDRange.Max})
+	}
+	// Pairwise overlap detection on the declared ranges. n is at
+	// most the number of scalesets — small enough that O(n^2) is
+	// cheaper than sorting.
+	for i := 0; i < len(declared); i++ {
+		for j := i + 1; j < len(declared); j++ {
+			a, b := declared[i], declared[j]
+			if a.max < b.min || b.max < a.min {
+				continue // disjoint
+			}
+			return fmt.Errorf("scalesets: %q vmid_range [%d, %d] overlaps %q [%d, %d] — overlapping ranges race on Proxmox clone (issue #222); declare disjoint ranges",
+				a.name, a.min, a.max, b.name, b.min, b.max)
+		}
+	}
+	return nil
+}
+
+// nicBridgeAllowed matches the bridge-identifier alphabet Proxmox
+// accepts. Rejecting characters outside this set prevents an
+// operator YAML value like `bridge: "vmbr0,firewall=1"` from
+// silently injecting additional comma-separated net<idx> segments
+// when the orchestrator stamps the value into Proxmox's NIC config
+// (issue #284). The same alphabet is reused for any future
+// scalar-but-injectable NIC fields.
+var nicBridgeAllowed = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
+// validateNIC enforces the VLAN/MTU range invariants plus the
+// Bridge alphabet check shared between the main profile NIC and
+// each ExtraNIC. Empty bridge is allowed for the main NIC (it
+// inherits the global proxmox.network.bridge); callers that
+// require a non-empty bridge must check separately.
+func validateNIC(prefix, bridge string, vlanTag, mtu int) error {
+	if bridge != "" && !nicBridgeAllowed.MatchString(bridge) {
+		return fmt.Errorf("%s.bridge must match %s (got %q)", prefix, nicBridgeAllowed.String(), bridge)
+	}
+	if vlanTag < 0 || vlanTag > 4094 {
+		return fmt.Errorf("%s.vlan_tag must be in [0, 4094]", prefix)
+	}
+	if mtu < 0 || mtu > 9216 {
+		return fmt.Errorf("%s.mtu must be in [0, 9216]", prefix)
+	}
+	return nil
+}
+
+// validateProfileNetworks enforces internal consistency on each
+// profile's optional network block: an IPAM backend of "static"
+// must declare a non-empty pool, and IP entries must parse. The
+// detailed format validation is intentionally lightweight — the
+// orchestrator stamps the value into Proxmox's ipconfig0 field
+// verbatim, so a malformed entry surfaces as a Proxmox API error
+// at clone time. We just catch the obvious "static backend with
+// no pool" case where the operator clearly forgot a field.
+func (c *Config) validateProfileNetworks() error {
+	for si := range c.Scalesets {
+		s := &c.Scalesets[si]
+		for i, p := range s.Profiles {
+			prefix := fmt.Sprintf("scalesets[%d] %q.profiles[%d] %q", si, s.Name, i, p.Name)
+			if p.Network == nil {
+				continue
+			}
+			if err := validateNIC(prefix+".network", p.Network.Bridge, p.Network.VLANTag, p.Network.MTU); err != nil {
+				return err
+			}
+			for j, nic := range p.Network.ExtraNICs {
+				nicPrefix := fmt.Sprintf("%s.network.extra_nics[%d]", prefix, j)
+				if nic.Bridge == "" {
+					return fmt.Errorf("%s.bridge is required", nicPrefix)
+				}
+				if err := validateNIC(nicPrefix, nic.Bridge, nic.VLANTag, nic.MTU); err != nil {
+					return err
+				}
+			}
+			if p.Network.IPAM == nil {
+				continue
+			}
+			ip := p.Network.IPAM
+			switch ip.Backend {
+			case "", "noop":
+				if len(ip.Pool) > 0 {
+					return fmt.Errorf("%s: ipam.pool must be empty when backend=noop", prefix)
+				}
+			case "static":
+				if len(ip.Pool) == 0 {
+					return fmt.Errorf("%s: ipam.pool is required when backend=static", prefix)
+				}
+			default:
+				return fmt.Errorf("%s: ipam.backend %q is not supported (must be one of: noop, static)", prefix, ip.Backend)
+			}
+		}
+	}
+	return nil
+}
+
+// validateProfileCanaries catches the canonical canary
+// misconfigurations:
+//   - canary_percent > 0 with no canary_template_vmid (the
+//     orchestrator would always pick stable, masking the operator's
+//     intent).
+//   - canary_max_failure_rate > 0 with no candidate (the
+//     auto-revert path can never fire — operator probably meant
+//     to set canary_template_vmid too).
+func (c *Config) validateProfileCanaries() error {
+	for si := range c.Scalesets {
+		s := &c.Scalesets[si]
+		for i, p := range s.Profiles {
+			if p.CanaryTemplateVMID == 0 {
+				if p.CanaryPercent > 0 {
+					return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: canary_percent > 0 requires canary_template_vmid",
+						si, s.Name, i, p.Name)
+				}
+				if p.CanaryMaxFailureRate > 0 {
+					return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: canary_max_failure_rate > 0 requires canary_template_vmid",
+						si, s.Name, i, p.Name)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// validateNodeAffinity enforces that every affinity rule's
+// match.profile / anti_affinity_with.profile (when set) names a
+// declared profile, and that prefer_nodes entries (when set) name
+// nodes the operator actually advertised in nodes.members or
+// nodes.single_node. Catches the canonical typo where an operator
+// adds a `match: { profile: gpus }` rule for a profile they
+// actually named `gpu` — the rule would silently never fire.
+func (c *Config) validateNodeAffinity() error {
+	if len(c.Nodes.Affinity) == 0 {
+		return nil
+	}
+	// Profile names are scoped per-scaleset, so a rule that
+	// names "gpu" matches if ANY scaleset declares a "gpu"
+	// profile. Operators wanting per-scaleset affinity will
+	// need a future syntax extension (`match: { scaleset: ...,
+	// profile: ... }`); the current rule shape is intentionally
+	// scaleset-agnostic.
+	knownProfiles := make(map[string]struct{})
+	for si := range c.Scalesets {
+		for _, p := range c.Scalesets[si].Profiles {
+			knownProfiles[p.Name] = struct{}{}
+		}
+	}
+	knownNodes := make(map[string]struct{}, len(c.Nodes.Members)+1)
+	for _, n := range c.Nodes.Members {
+		knownNodes[n] = struct{}{}
+	}
+	if c.Nodes.SingleNode != "" {
+		knownNodes[c.Nodes.SingleNode] = struct{}{}
+	}
+	for i, r := range c.Nodes.Affinity {
+		if r.Match.Profile != "" {
+			if _, ok := knownProfiles[r.Match.Profile]; !ok {
+				return fmt.Errorf("nodes.affinity[%d].match.profile %q is not a declared profile", i, r.Match.Profile)
+			}
+		}
+		if r.AntiAffinityWith.Profile != "" {
+			if _, ok := knownProfiles[r.AntiAffinityWith.Profile]; !ok {
+				return fmt.Errorf("nodes.affinity[%d].anti_affinity_with.profile %q is not a declared profile", i, r.AntiAffinityWith.Profile)
+			}
+		}
+		for j, n := range r.PreferNodes {
+			if _, ok := knownNodes[n]; !ok {
+				return fmt.Errorf("nodes.affinity[%d].prefer_nodes[%d] %q is not a declared node", i, j, n)
+			}
+		}
+		if r.Require && len(r.PreferNodes) == 0 {
+			return fmt.Errorf("nodes.affinity[%d]: require=true is only meaningful with prefer_nodes (otherwise there is nothing to require)", i)
+		}
+	}
+	return nil
+}
+
+// validateQuotas enforces the exactly-one-of-org-or-repo rule on
+// overrides. Detailed semantics live in internal/quotas; the check
+// is duplicated here so a malformed config fails at Load time with
+// a stable error message instead of later at app startup.
+func (c *Config) validateQuotas() error {
+	for i, o := range c.Quotas.Overrides {
+		hasOrg, hasRepo := o.Match.Org != "", o.Match.Repo != ""
+		if hasOrg == hasRepo {
+			return fmt.Errorf("quotas.overrides[%d].match: set exactly one of org or repo", i)
+		}
+	}
+	return nil
+}
+
+// validatePriority enforces non-empty, unique class names. The
+// upstream priority.Matcher enforces the same rules at New() time;
+// catching them here is operator-experience polish.
+func (c *Config) validatePriority() error {
+	seen := make(map[string]int, len(c.Priority.Classes))
+	for i, cl := range c.Priority.Classes {
+		if cl.Name == "" {
+			return fmt.Errorf("priority.classes[%d].name is required", i)
+		}
+		if prev, dup := seen[cl.Name]; dup {
+			return fmt.Errorf("priority.classes: duplicate class name %q at indexes %d and %d", cl.Name, prev, i)
+		}
+		seen[cl.Name] = i
+	}
+	return nil
+}
+
+// profileNameRE constrains profile names to the same character set
+// Proxmox tags accept after sanitisation, so a name can round-trip
+// through tags.ProfileTag without surprises.
+var profileNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+
+// validateProfiles enforces per-scaleset profile-list invariants
+// and the fleet-wide GlobalMax ceiling. Per-profile inheritance
+// from global pool fields already happened in ApplyDefaults.
+//
+// Profile names are scoped to their owning scaleset, so two
+// scalesets may both declare a "default" profile without
+// collision. The label-coverage check runs per-scaleset: each
+// scaleset's profiles must collectively cover that scaleset's
+// labels.
+func (c *Config) validateProfiles() error {
+	sumMax := 0
+	for si := range c.Scalesets {
+		s := &c.Scalesets[si]
+		if len(s.Profiles) == 0 {
+			// ApplyDefaults guarantees >= 1 profile per
+			// scaleset; defending against a caller that
+			// bypassed it (e.g. constructing a Config in a
+			// test) keeps later code from segfaulting.
+			return fmt.Errorf("scalesets[%d] %q.profiles: at least one profile is required", si, s.Name)
+		}
+		seen := make(map[string]int, len(s.Profiles))
+		for i, p := range s.Profiles {
+			if !profileNameRE.MatchString(p.Name) {
+				return fmt.Errorf("scalesets[%d] %q.profiles[%d].name %q must match %s",
+					si, s.Name, i, p.Name, profileNameRE.String())
+			}
+			if prev, dup := seen[p.Name]; dup {
+				return fmt.Errorf("scalesets[%d] %q.profiles: duplicate name %q at indexes %d and %d",
+					si, s.Name, p.Name, prev, i)
+			}
+			seen[p.Name] = i
+			maxConc := p.MaxConcurrentRunnersOrDefault(s.MaxConcurrentRunners)
+			if maxConc <= 0 {
+				return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: max_concurrent_runners must be > 0 (inherited from scaleset when omitted)",
+					si, s.Name, i, p.Name)
+			}
+			hot := p.HotSizeOrDefault(c.Pool.HotSize)
+			warm := p.WarmSizeOrDefault(c.Pool.WarmSize)
+			if hot+warm > maxConc {
+				return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: hot_size+warm_size (%d) must not exceed max_concurrent_runners (%d)",
+					si, s.Name, i, p.Name, hot+warm, maxConc)
+			}
+			if p.BootMaxAttempts != nil && *p.BootMaxAttempts < 1 {
+				return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: boot_max_attempts (%d) must be >= 1",
+					si, s.Name, i, p.Name, *p.BootMaxAttempts)
+			}
+			// Schedule sizes must not exceed the profile's
+			// max_concurrent_runners — otherwise a fired
+			// schedule would permanently exceed the cap.
+			for j, sched := range p.Schedules {
+				if sched.HotSize+sched.WarmSize > maxConc {
+					return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q.schedules[%d] %q: hot_size+warm_size (%d) must not exceed max_concurrent_runners (%d)",
+						si, s.Name, i, p.Name, j, sched.Name, sched.HotSize+sched.WarmSize, maxConc)
+				}
+			}
+			sumMax += maxConc
+		}
+		// Label-routing safety: every label this scaleset
+		// advertises must be present on at least one of its
+		// profiles.
+		if gaps := uncoveredScaleSetLabels(s.Labels, s.Profiles); len(gaps) > 0 {
+			return fmt.Errorf("scalesets[%d] %q: no profile covers labels %v — add the labels to a profile or remove them from scaleset.labels",
+				si, s.Name, gaps)
+		}
+	}
+	if c.Pool.GlobalMax > 0 && sumMax > c.Pool.GlobalMax {
+		return fmt.Errorf("pool.global_max (%d) is below the sum of profile.max_concurrent_runners across all scalesets (%d)",
+			c.Pool.GlobalMax, sumMax)
+	}
+	return nil
+}
+
+// scheduleParser is the cron parser used to validate schedule
+// expressions at load time. Standard 5-field syntax (minute hour
+// dom month dow) — matches the issue's examples and is the form
+// operators write by hand. Descriptor support (@hourly etc.) is
+// included as a small convenience.
+var scheduleParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+
+// resolveSchedules parses each schedule's Duration / Timezone /
+// Cron expression in place. prefix is included in any error
+// message so the operator can find the offending entry (e.g.
+// "profiles[0] \"cpu\".schedules[1] \"night-mode\"").
+func resolveSchedules(schedules []ScheduleConfig, prefix string) error {
+	seen := make(map[string]int, len(schedules))
+	for i := range schedules {
+		s := &schedules[i]
+		if prev, dup := seen[s.Name]; dup {
+			return fmt.Errorf("%s.schedules: duplicate name %q at indexes %d and %d", prefix, s.Name, prev, i)
+		}
+		seen[s.Name] = i
+
+		if s.Duration.D() <= 0 {
+			return fmt.Errorf("%s.schedules[%d] %q.duration must be positive", prefix, i, s.Name)
+		}
+
+		loc := time.UTC
+		if s.Timezone != "" {
+			l, err := time.LoadLocation(s.Timezone)
+			if err != nil {
+				return fmt.Errorf("%s.schedules[%d] %q.timezone: %w", prefix, i, s.Name, err)
+			}
+			loc = l
+		}
+		s.Location = loc
+
+		sched, err := scheduleParser.Parse(s.Cron)
+		if err != nil {
+			return fmt.Errorf("%s.schedules[%d] %q.cron: %w", prefix, i, s.Name, err)
+		}
+		s.CronSchedule = sched
+	}
+	return nil
+}
+
+// uncoveredScaleSetLabels returns the labels in scaleSetLabels that
+// no profile's label set contains. Used by Validate to enforce the
+// label-routing coverage invariant.
+func uncoveredScaleSetLabels(scaleSetLabels []string, profiles []ProfileConfig) []string {
+	union := make(map[string]struct{})
+	for _, p := range profiles {
+		for _, l := range p.Labels {
+			union[l] = struct{}{}
+		}
+	}
+	var gaps []string
+	for _, l := range scaleSetLabels {
+		if _, ok := union[l]; !ok {
+			gaps = append(gaps, l)
+		}
+	}
+	return gaps
+}
+
+// BuildServerTLS returns a *tls.Config suitable for an
+// http.Server.TLSConfig. When CAFile is set, ClientAuth is set to
+// RequireAndVerifyClientCert so mTLS is enforced — pair with a
+// matching client-side cert on every peer.
+func (t *TLSConfig) BuildServerTLS() (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load tls keypair %q/%q: %w", t.CertFile, t.KeyFile, err)
+	}
+	cfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+	if t.CAFile != "" {
+		pool, err := loadCAPool(t.CAFile)
+		if err != nil {
+			return nil, err
+		}
+		cfg.ClientCAs = pool
+		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return cfg, nil
+}
+
+// BuildClientTLS returns a *tls.Config suitable for an
+// http.Transport.TLSClientConfig. CAFile pins the server cert against
+// a private CA when set; otherwise the system roots are used (subject
+// to InsecureSkipVerify).
+func (t *TLSConfig) BuildClientTLS() (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load tls keypair %q/%q: %w", t.CertFile, t.KeyFile, err)
+	}
+	cfg := &tls.Config{
+		Certificates:       []tls.Certificate{cert},
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: t.InsecureSkipVerify, //nolint:gosec // user-opt-in for lab/test
+	}
+	if t.CAFile != "" {
+		pool, err := loadCAPool(t.CAFile)
+		if err != nil {
+			return nil, err
+		}
+		cfg.RootCAs = pool
+	}
+	return cfg, nil
+}
+
+func loadCAPool(path string) (*x509.CertPool, error) {
+	pem, err := os.ReadFile(path) //nolint:gosec // path comes from a trusted config file
+	if err != nil {
+		return nil, fmt.Errorf("read ca file %q: %w", path, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("ca file %q contained no usable PEM blocks", path)
+	}
+	return pool, nil
+}
+
+// validate checks that referenced files exist. Loading and parsing the
+// PEM content happens lazily in BuildServerTLS / BuildClientTLS so a
+// missing cert at config-load time is a hard failure, but a bad PEM
+// surfaces with file context when the server actually starts.
+func (t *TLSConfig) validate(prefix string) error {
+	if t.CertFile == "" {
+		return fmt.Errorf("%s.cert_file is required when tls is configured", prefix)
+	}
+	if t.KeyFile == "" {
+		return fmt.Errorf("%s.key_file is required when tls is configured", prefix)
+	}
+	if _, err := os.Stat(t.CertFile); err != nil {
+		return fmt.Errorf("%s.cert_file %q: %w", prefix, t.CertFile, err)
+	}
+	if _, err := os.Stat(t.KeyFile); err != nil {
+		return fmt.Errorf("%s.key_file %q: %w", prefix, t.KeyFile, err)
+	}
+	if t.CAFile != "" {
+		if _, err := os.Stat(t.CAFile); err != nil {
+			return fmt.Errorf("%s.ca_file %q: %w", prefix, t.CAFile, err)
+		}
+	}
+	return nil
+}

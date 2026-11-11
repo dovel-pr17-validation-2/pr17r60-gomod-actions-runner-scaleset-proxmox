@@ -1,0 +1,415 @@
+# actions-runner-scaleset-proxmox — example configuration.
+#
+# Every key in this file is overridable via an env var named with the
+# yaml key path uppercased, dots replaced by underscores, and prefixed
+# with `SCALESET_`. snake_case yaml keys are preserved as single tokens
+# (e.g. `pool.hot_size` is one key, not nested under hot.size). Examples:
+#
+#   github.pat.token          → SCALESET_GITHUB_PAT_TOKEN
+#   proxmox.auth.token_secret → SCALESET_PROXMOX_AUTH_TOKEN_SECRET
+#   admin_api.shared_secret   → SCALESET_ADMIN_API_SHARED_SECRET
+#   pool.hot_size             → SCALESET_POOL_HOT_SIZE
+#
+# Secrets MUST come from env (or another secure config-loader source);
+# writing them into yaml is not recommended. Required env vars for a
+# typical PAT deployment:
+#
+#   - SCALESET_GITHUB_PAT_TOKEN
+#   - SCALESET_PROXMOX_AUTH_TOKEN_SECRET
+#   - SCALESET_ADMIN_API_SHARED_SECRET  (optional; required when admin_api.http_addr is set)
+#
+# Unknown SCALESET_*-prefixed env vars (typos like
+# SCALESET_POOL_HOTSIZE without the second underscore) are logged at
+# startup so the misconfiguration is loud.
+
+github:
+  # "app" or "pat".
+  auth_mode: pat
+
+  # Used when auth_mode = app. Set exactly one of client_id (newer Apps,
+  # format "Iv23...") or app_id (legacy numeric ID).
+  # app:
+  #   client_id: "Iv23likB94..."
+  #   # app_id: 123456
+  #   installation_id: 789012
+  #   private_key_path: /etc/scaleset/github-app.pem
+  #   # GHES (mirrors the pat: knobs below; same per-scope
+  #   # semantics). config_url and config_base_url are mutually
+  #   # exclusive; config_url is incompatible with multi-scaleset.
+  #   # rest_base_url overrides go-github's BaseURL for the App
+  #   # installation-token fetch + subsequent REST calls.
+  #   # config_url: https://ghes.example.com/my-org
+  #   # config_base_url: https://ghes.example.com
+  #   # rest_base_url: https://ghes.example.com/api/v3/
+
+  # Used when auth_mode = pat. The token must be supplied via
+  # SCALESET_GITHUB_PAT_TOKEN (not written into yaml).
+  pat: {}
+  # GHES: point the orchestrator at your enterprise instance. The
+  # two override forms are mutually exclusive:
+  #
+  #   config_url      — full URL with the org/repo baked in. Use
+  #                     for single-scaleset GHES. Multi-scaleset
+  #                     deployments would force every scaleset to
+  #                     handshake against the same scope; the
+  #                     config validator rejects this combination.
+  #
+  #   config_base_url — scheme + host only. The orchestrator joins
+  #                     it with each scaleset's scope at runtime
+  #                     so per-scaleset clients hit the right
+  #                     /<org> path on the shared host. Required
+  #                     for multi-scaleset GHES (issue #214).
+  #
+  # Leave both empty when running against github.com — the default
+  # per-scope URL derivation already targets the right per-org
+  # endpoint.
+  #   config_url: https://ghes.example.com/my-org
+  #   config_base_url: https://ghes.example.com
+
+  # Exactly one of org or repo.
+  scope:
+    org: my-org
+    # repo: my-org/my-repo
+
+  # GitHub REST reconciler. Periodically lists the runners API and joins
+  # the result against our DB; this catches VMs that the scaleset
+  # listener silently lost (the JobStarted/JobCompleted callbacks the
+  # listener occasionally drops or delivers with empty fields).
+  poll_interval: 15s                # how often to query GitHub
+  assigned_grace: 5m                # destroy assigned VMs whose runner never picked up work
+  running_idle_grace: 30s           # destroy running VMs whose runner went idle (missed JobCompleted)
+  assigned_offline_grace: 2m        # destroy assigned VMs whose runner registered then went offline
+
+scaleset:
+  name: proxmox-ubuntu-x64
+  labels: [self-hosted, linux, x64, proxmox]
+  runner_group: default
+  max_concurrent_runners: 50
+
+# --- Multi-scaleset shape (issue #1) ---
+# As an alternative to the singular `scaleset:` + top-level
+# `github.scope` + top-level `profiles:` form above, declare a
+# `scalesets:` list with one entry per scale set. Each entry
+# carries its own scope (org/repo), labels, max_concurrent_runners,
+# runner_group, vmid_range, and per-scaleset `profiles:`. Mixing
+# the two forms is rejected at load.
+#
+# Each declared scale set runs under its own pool manager, scaler,
+# listener, REST reconciler, canary controller, schedule runner,
+# store, and provisioner. The workers are spawned under a single
+# supervisor: a panic or returned error in one scale set is
+# recovered and logged but does NOT poison its siblings.
+#
+# With N > 1 scalesets, each entry MUST declare its own
+# `vmid_range` and the ranges must be pairwise disjoint. Each
+# scaleset's pool manager runs an independent VMID allocator,
+# so sharing one range would race on Proxmox clone (issue #222).
+# Partition the global proxmox.vmid_range into per-scaleset
+# slices that together cover it (or any disjoint subset).
+#
+# scalesets:
+#   - name: linux-x64
+#     labels: [self-hosted, linux, x64, proxmox]
+#     runner_group: default
+#     max_concurrent_runners: 50
+#     scope: { org: my-org }
+#     vmid_range: { min: 10000, max: 14999 }
+#     profiles:
+#       - name: linux-x64
+#         labels: [self-hosted, linux, x64, proxmox]
+#         hot_size: 5
+#         warm_size: 10
+#         max_concurrent_runners: 50
+#   - name: gpu-pool
+#     labels: [self-hosted, linux, gpu]
+#     max_concurrent_runners: 4
+#     scope: { org: my-other-org }
+#     vmid_range: { min: 15000, max: 19999 }
+#     profiles:
+#       - name: gpu
+#         labels: [self-hosted, linux, gpu]
+#         template_vmid: 9100
+#         cpu: 8
+#         memory_mb: 32768
+#         hot_size: 0
+#         warm_size: 1
+#         max_concurrent_runners: 4
+
+proxmox:
+  endpoint: https://pve.example.com:8006/api2/json
+  insecure_skip_verify: false
+  auth:
+    token_id: scaleset@pve!automation
+    # token_secret must be supplied via SCALESET_PROXMOX_AUTH_TOKEN_SECRET
+    # (not written into yaml).
+  template_vmid: 9000
+  vmid_range: { min: 10000, max: 19999 }
+  storage:
+    disk: local-lvm
+    snippets: local
+  network:
+    bridge: vmbr0
+    vlan_tag: 0       # 0 = untagged
+  clone:
+    linked: true      # linked clones complete in 1-3s but pin to template storage
+
+nodes:
+  strategy: single                # single | round_robin | least_loaded
+  members: [pve1, pve2, pve3]     # ignored for "single"
+  single_node: pve1               # only used when strategy = single
+
+  # Optional profile-keyed placement rules. Each rule is evaluated
+  # against the cloning row's profile in declaration order; the
+  # first match wins. An empty match.profile is a wildcard.
+  # Validation rejects rules referencing undeclared profiles or
+  # nodes — typos fail at load time, not silently at runtime.
+  #
+  # prefer_nodes restricts candidate nodes; require=true makes that
+  # a hard pin (clone fails with ErrAffinityRequireUnsatisfiable
+  # when no preferred node is eligible). anti_affinity_with
+  # excludes nodes already hosting a tracked VM with the matching
+  # profile. Both filters apply BEFORE the underlying strategy
+  # rotates / load-balances among the surviving nodes.
+  #
+  # affinity:
+  #   - match: { profile: gpu }
+  #     prefer_nodes: [pve-gpu-1, pve-gpu-2]
+  #     require: true             # hard pin — clone fails if neither has capacity
+  #   - match: { profile: untrusted-pr }
+  #     anti_affinity_with: { profile: prod }
+
+pool:
+  hot_size: 2                     # always-booted idle runners (default; profiles can override)
+  warm_size: 3                    # pre-cloned, powered-off runners (default; profiles can override)
+  # Optional fleet-wide ceiling on the sum of per-profile
+  # max_concurrent_runners. Validation rejects the config when the
+  # arithmetic exceeds this. Leave at 0 (default) for no cap.
+  # global_max: 50
+  reconcile_interval: 10s
+  vm_max_age: 24h                 # idle Hot/Warm VMs older than this are recycled
+  drain_timeout: 30m              # max wait for running jobs on SIGTERM
+  boot_max_attempts: 3            # after this many WaitReady failures the VM is "poisoned"
+  # How often the orchestrator polls Proxmox for the power state of
+  # Assigned/Running VMs. The in-VM gh-runner.service powers off on job
+  # completion (ExecStopPost=poweroff), so observing "stopped" here is
+  # the signal to mark the row completed and queue destroy. Lower =
+  # snappier end-of-job tail; higher = lighter Proxmox load.
+  power_poll_interval: 3s
+
+  # Minimum time after a destroy completes before the VMID allocator
+  # may reissue the same ID. Protects against PVE-side qmdestroy task
+  # settle / lock-file contention: without it, a fresh clone targets
+  # a VMID Proxmox is still tearing down and produces
+  # "VM N is running - destroy failed" + lock-file timeouts.
+  vmid_reuse_cooldown: 30s
+
+  # Time a Proxmox VM may exist without a matching store row before
+  # the GitHub reconciler's orphan sweep destroys it. Must exceed the
+  # typical Clone -> guest-agent-ready -> JIT-inject worst case so the
+  # sweep doesn't kill VMs the pool worker is still booting.
+  orphan_grace: 60s
+
+  # TTL safety net for the Provisioner's in-flight clone tracker.
+  # Entries older than this are pruned by a background sweep in case
+  # Clone hangs and never returns to clear them.
+  clone_inflight_grace: 5m
+
+# Optional runner profiles — a named bundle of {labels, template,
+# hardware shape, per-profile pool sizing}. Each profile gets its
+# own reconcile loop and pool state; VMs are tagged with their
+# profile name so crash recovery routes them back into the right
+# pool.
+#
+# Omit the whole block and the orchestrator synthesises a single
+# "default" profile from the global pool / scaleset values above —
+# pre-profile configs keep working unchanged.
+#
+# Per-profile sizing knobs (hot_size, warm_size,
+# max_concurrent_runners, boot_max_attempts) accept an explicit 0;
+# leave them off entirely to inherit the global pool / scaleset
+# default.
+#
+# Label routing: when JobStarted fires, the scaler picks the profile
+# whose labels are the smallest superset of the job's RequestLabels
+# (ties resolve by declaration order). Unrouted jobs increment
+# scaleset_unrouted_jobs_total{labels="..."}. Config validation
+# rejects scale sets whose declared labels aren't collectively
+# covered by some profile, so a missing label is a load-time error
+# rather than a per-job runtime miss.
+#
+# profiles:
+#   - name: linux-x64
+#     labels: [self-hosted, linux, proxmox, x64]
+#     template_vmid: 9000           # optional override of the global proxmox.template_vmid
+#     cpu: 4                        # cores; 0 inherits the template default
+#     memory_mb: 8192               # 0 inherits the template default
+#     disk_gb: 0                    # 0 inherits the template default (resize is absolute)
+#     storage: ""                   # override of proxmox.storage.disk for full clones; "" inherits
+#     hot_size: 5
+#     warm_size: 10
+#     max_concurrent_runners: 20
+#     boot_max_attempts: 3
+#     vm_max_age: 12h               # per-profile recycle window
+#     # Optional cron-driven pool-size overrides (issue #9).
+#     # On each fire, the runner sets hot_size/warm_size for
+#     # the profile and holds them for `duration`; then the
+#     # reconcile loop reverts to the profile baseline above
+#     # unless another schedule's window is still open
+#     # (last-fired wins). Sizes are clamped to
+#     # max_concurrent_runners. Fires emit
+#     # scaleset_schedule_fires_total{profile, schedule};
+#     # the active override is exposed as
+#     # scaleset_schedule_active{profile, schedule}.
+#     schedules:
+#       - name: business-hours
+#         cron: "0 8 * * 1-5"       # 8am Mon-Fri
+#         duration: 10h
+#         timezone: America/New_York
+#         hot_size: 10
+#         warm_size: 20
+#       - name: night-mode
+#         cron: "0 18 * * 1-5"      # 6pm Mon-Fri
+#         duration: 14h             # extends to 8am next day
+#         timezone: America/New_York
+#         hot_size: 2
+#         warm_size: 5
+#     # Optional per-profile network. Each field is optional;
+#     # omitted ones inherit proxmox.network.*. ipam.backend
+#     # is "noop" (default; DHCP via cloud-init) or "static"
+#     # (in-memory pool fed by ipam.pool). External IPAM
+#     # backends (NetBox / Infoblox / phpIPAM) plug in behind
+#     # the same ipam.Allocator interface; none ship in-tree
+#     # yet because they need a live IPAM to verify.
+#     # network:
+#     #   bridge: vmbr0
+#     #   vlan_tag: 0
+#     #   mtu: 1500
+#     #   ipam:
+#     #     backend: noop
+#   - name: gpu
+#     labels: [self-hosted, linux, proxmox, gpu]
+#     template_vmid: 9100
+#     cpu: 8
+#     memory_mb: 32768
+#     hot_size: 0                   # explicit 0 — no idle pool, clone on demand
+#     warm_size: 1
+#     max_concurrent_runners: 4
+#     # Optional template-canary rollout (issue #5). When
+#     # canary_template_vmid is set, canary_percent% of new clones
+#     # use the candidate template; the rest use template_vmid.
+#     # Boot failures on canary clones feed a running failure
+#     # rate; once the rate exceeds canary_max_failure_rate the
+#     # orchestrator auto-reverts canary_percent to 0 in-process
+#     # and emits scaleset_canary_reverted_total{profile=...}.
+#     # POST /admin/template/promote/<profile> atomically swaps
+#     # candidate into stable. Both are in-process only — update
+#     # template_vmid in YAML for the promotion to survive
+#     # restart.
+#     canary_template_vmid: 9101    # staging template
+#     canary_percent: 10            # 10% of clones use the candidate
+#     canary_max_failure_rate: 0.2  # auto-revert at 20% canary boot failures
+#     network:
+#       bridge: vmbr1               # GPU VLAN
+#       vlan_tag: 30
+#       mtu: 9000                   # jumbo frames for the storage path
+#       extra_nics:
+#         - bridge: vmbr-storage    # second NIC for shared storage
+#           vlan_tag: 100
+#           mtu: 9000
+#       ipam:
+#         backend: static
+#         pool:
+#           - 10.0.30.10/24
+#           - 10.0.30.11/24
+#           - 10.0.30.12/24
+#           - 10.0.30.13/24
+
+# Optional per-org / per-repo concurrency caps. Both blocks are
+# OBSERVATIONAL today: the actions/scaleset listener surfaces
+# per-job metadata only AFTER GitHub has paired a job with a VM,
+# so the orchestrator records over-cap events via
+# scaleset_quota_throttled_total{scope, name} rather than rejecting
+# acquisitions. Set defaults + overrides to make visibility
+# meaningful; future enforcement will reuse the same config shape.
+#
+# Each override must set exactly one of `org` or `repo`; the
+# `default_per_*` knobs apply when nothing more specific matches.
+# 0 disables a knob (an override of 0 explicitly opts a scope out
+# of the default cap — useful for an internal-tooling repo you
+# want uncapped).
+#
+# quotas:
+#   default_per_repo: 5
+#   default_per_org: 20
+#   overrides:
+#     - match: { repo: "acme/heavy-ci" }
+#       max_concurrent: 15
+#     - match: { org: "acme-platform" }
+#       max_concurrent: 30
+
+# Optional priority classes. The scaler stamps each job's matching
+# class onto the VM row and emits scaleset_priority_acquires_total
+# {class}. `preempt: true` enables the admin /admin/preempt/{vmid}
+# endpoint to destroy lower-class VMs to free capacity — Running
+# VMs are NEVER preempted, only Assigned-but-not-yet-Running ones.
+#
+# Match rules: every non-empty selector field must equal the job's
+# corresponding field. Empty selectors are wildcards. Tiebreakers
+# (same specificity) resolve by declaration order, so list your
+# classes from most-important to least-important.
+#
+# priority:
+#   classes:
+#     - name: critical
+#       match: { workflow_label: "priority:critical" }
+#       weight: 100
+#       preempt: true
+#     - name: standard
+#       weight: 10
+#     - name: best_effort
+#       match: { repo: "acme/research" }
+#       weight: 1
+
+observability:
+  http_addr: ":9100"              # exposes /metrics /healthz /readyz
+  log_level: info                 # debug | info | warn | error
+  log_format: json                # json | text
+  # Optional OTLP/HTTP tracing. Leave endpoint empty to disable —
+  # instrumented code paths then use the no-op tracer and are free.
+  tracing:
+    endpoint: ""                  # e.g. "otel-collector:4318" (host:port only)
+    insecure: false               # true = plain HTTP, false = HTTPS
+    sample_ratio: 1.0             # [0.0, 1.0]; 1.0 = sample everything
+
+admin_api:                        # optional escape hatch HTTP API
+  # http_addr: "127.0.0.1:9101"
+  # shared_secret comes from SCALESET_ADMIN_API_SHARED_SECRET env var.
+
+# Multi-replica deployment via Kubernetes leader election. Leave at the
+# default "standalone" for single-process / Docker / systemd. The
+# binary is identical in both modes — only this block changes.
+cluster:
+  mode: standalone                # standalone | raft
+  # raft:
+  #   node_id: ""                 # defaults to $HOSTNAME, then os.Hostname
+  #   bind_addr: "0.0.0.0:7000"
+  #   advertise_addr: "10.0.0.1:7000"
+  #   # data_dir is required when mode=raft. Raft's election-safety
+  #   # invariants (currentTerm, votedFor) must survive restart so a
+  #   # node cannot vote twice in the same term. Persist this on a
+  #   # volume that outlives the container/process.
+  #   data_dir: "/var/lib/scaleset/raft"
+  #   bootstrap: true             # set true on exactly one replica at initial setup
+  #   heartbeat_timeout: 1s
+  #   election_timeout: 1s
+  #   commit_timeout: 50ms
+  #   peers:
+  #     - node_id: node-a
+  #       raft_addr: 10.0.0.1:7000
+  #       http_addr: 10.0.0.1:9101
+  #     - node_id: node-b
+  #       raft_addr: 10.0.0.2:7000
+  #       http_addr: 10.0.0.2:9101
+  #     - node_id: node-c
+  #       raft_addr: 10.0.0.3:7000
+  #       http_addr: 10.0.0.3:9101

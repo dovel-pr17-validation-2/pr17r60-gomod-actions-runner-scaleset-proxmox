@@ -1,0 +1,179 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  schedule:
+    # Weekly govulncheck run against main so newly-disclosed CVEs on
+    # already-pinned deps surface even when no PR touches the repo.
+    - cron: "0 8 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26.3'
+          cache: true
+
+      - name: Run go fmt
+        run: |
+          if [ -n "$(gofmt -s -l .)" ]; then
+            echo "Go code is not formatted:"
+            gofmt -s -d .
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9
+        with:
+          version: v2.12.2
+          args: --timeout=5m
+
+      - name: Run deadcode
+        run: |
+          go install golang.org/x/tools/cmd/deadcode@v0.30.0
+          # -test treats test files as call sites, which is required
+          # for internal/testutil/ packages whose only consumers are
+          # _test.go files. -tags=e2e is required for testutil helpers
+          # whose only callers are the build-tagged e2e scenarios under
+          # test/e2e (e.g. fakegithub.PostJobStarted, fakeproxmox.PowerOff).
+          out=$(deadcode -test -tags=e2e ./...)
+          if [ -n "$out" ]; then
+            echo "deadcode found unreachable functions:"
+            echo "$out"
+            exit 1
+          fi
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26.3'
+          cache: true
+
+      - name: Run tests
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Enforce per-package coverage floor
+        # Pinned floors (% of statements) for packages whose
+        # coverage materially affects orchestration safety.
+        # Floors are set to the current measured value rounded
+        # down to the nearest 5%, so a future drop fails CI
+        # visibly rather than going unnoticed. Bump the floor
+        # in lockstep with any deliberate coverage improvement.
+        run: |
+          declare -A FLOORS=(
+            [github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool]=75
+            [github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner]=75
+            [github.com/jeffresc/actions-runner-scaleset-proxmox/internal/scaler]=80
+            [github.com/jeffresc/actions-runner-scaleset-proxmox/internal/gh]=75
+          )
+          # go tool cover -func emits per-file rows + a final "total:" row.
+          # Aggregate per-package by summing statement counts via the
+          # coverage profile directly.
+          go tool cover -func=coverage.out > coverage_func.txt
+          echo "::group::Per-package coverage summary"
+          fail=0
+          for pkg in "${!FLOORS[@]}"; do
+            floor=${FLOORS[$pkg]}
+            # Lines look like:
+            #   github.com/.../internal/pool/manager.go:42:  funcName  78.3%
+            # Compute the unweighted average across the package's funcs.
+            pct=$(grep "^${pkg}/" coverage_func.txt | awk '{ gsub("%",""); n++; s+=$NF } END { if (n>0) printf "%.1f", s/n; else print "0" }')
+            printf '  %-70s actual=%s%%  floor=%s%%\n' "$pkg" "$pct" "$floor"
+            if awk -v a="$pct" -v b="$floor" 'BEGIN { exit !(a < b) }'; then
+              echo "    ::error::coverage of $pkg dropped below floor ($pct% < $floor%)"
+              fail=1
+            fi
+          done
+          echo "::endgroup::"
+          if [ "$fail" -ne 0 ]; then
+            echo "One or more packages dropped below their coverage floor. Either raise coverage with new tests or, if the drop is justified, lower the floor in .github/workflows/ci.yaml with a commit message explaining why."
+            exit 1
+          fi
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage
+          path: coverage.out
+
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26.3'
+          cache: true
+
+      - name: Run e2e tests
+        run: go test -tags=e2e -race -timeout=10m ./test/e2e/...
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26.3'
+          cache: true
+
+      - name: Build binary
+        run: go build -o bin/scaleset ./cmd/scaleset
+
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@b625fbe08f3bccbe446d94fbf87fcc875a4f50ee # v1.0.4
+        with:
+          go-version-input: '1.26.3'
+          # The action's own actions/checkout step duplicates the
+          # Authorization header already set by the outer Checkout step,
+          # which makes git fetch fail with HTTP 400. Reuse the existing
+          # working tree instead.
+          repo-checkout: false
+
+  helm-lint:
+    name: Helm Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Helm
+        uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5
+        with:
+          version: v3.14.0
+
+      - name: Lint Helm chart
+        run: helm lint deploy/chart
